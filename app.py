@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -26,7 +27,7 @@ class ProjectionInput:
     annual_return: float  # e.g. 0.065 for 6.5%
     target_monthly_spend: float  # for FI calculation (today's €)
     safe_withdrawal_rate: float = 0.04  # 4% rule by default
-    inflation_rate: float = 0.0         # optional inflation
+    inflation_rate: float = 0.0         # optional inflation per year
 
 
 @dataclass
@@ -47,7 +48,7 @@ class ProjectionResult:
     coast_fi_age: Optional[int]
 
 
-# ---------- Core Logic ----------
+# ---------- Core Deterministic Projection ----------
 
 def run_projection(params: ProjectionInput) -> ProjectionResult:
     """
@@ -127,6 +128,73 @@ def run_projection(params: ProjectionInput) -> ProjectionResult:
     )
 
 
+# ---------- Monte Carlo Simulation ----------
+
+def monte_carlo_simulation(
+    current_portfolio: float,
+    monthly_invest: float,
+    annual_bonus: float,
+    one_time_injections: List[OneTimeInjection],
+    current_age: int,
+    retirement_age: int,
+    annual_return: float,
+    annual_volatility: float,
+    runs: int = 1000,
+):
+    """
+    Monte Carlo simulation of future portfolio values.
+    annual_return and annual_volatility are decimals (0.065, 0.15).
+    Returns:
+        {
+            "ages": [age1, age2, ...],
+            "median": np.array,
+            "p10": np.array,
+            "p90": np.array,
+            "all_paths": np.array shape (runs, years)
+        }
+    """
+    years = retirement_age - current_age
+    ages = [current_age + i for i in range(1, years + 1)]
+
+    all_paths = np.zeros((runs, years))
+
+    # Pre-index injections for speed
+    injections_by_year = {}
+    for inj in one_time_injections:
+        injections_by_year.setdefault(inj.year_offset, 0.0)
+        injections_by_year[inj.year_offset] += inj.amount
+
+    for r in range(runs):
+        value = current_portfolio
+        for y in range(years):
+            yearly_return = np.random.normal(annual_return, annual_volatility)
+            monthly_rate = (1 + yearly_return) ** (1 / 12) - 1
+
+            for _ in range(12):
+                value = value * (1 + monthly_rate) + monthly_invest
+
+            # Annual bonus
+            value += annual_bonus
+
+            # One-time injections at end of year y+1
+            if (y + 1) in injections_by_year:
+                value += injections_by_year[y + 1]
+
+            all_paths[r, y] = value
+
+    median_curve = np.median(all_paths, axis=0)
+    p10_curve = np.percentile(all_paths, 10, axis=0)
+    p90_curve = np.percentile(all_paths, 90, axis=0)
+
+    return {
+        "ages": ages,
+        "median": median_curve,
+        "p10": p10_curve,
+        "p90": p90_curve,
+        "all_paths": all_paths,
+    }
+
+
 # ---------- Streamlit UI ----------
 
 def main():
@@ -135,9 +203,9 @@ def main():
 
     st.markdown(
         """
-        This tool projects your portfolio year by year, calculates your **FI number**  
-        and estimates the age at which you reach **Financial Independence (FI)**  
-        based on your inputs (monthly investing, bonus, returns, etc.).
+        This tool projects your portfolio year by year, calculates your **FI number**,  
+        estimates your **FI age**, **Coast FI age**, and runs a **Monte Carlo simulation**  
+        to show how market randomness affects your future.
         """
     )
 
@@ -150,7 +218,7 @@ def main():
     retirement_age = col2.number_input("Retirement Age", min_value=current_age + 1, max_value=80, value=67, step=1)
 
     current_portfolio = st.sidebar.number_input(
-        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=44327.73
+        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=40000.00
     )
 
     monthly_invest = st.sidebar.number_input(
@@ -195,7 +263,6 @@ def main():
         # year_offset = 1 means: at the end of the first projected year
         one_time_injections.append(OneTimeInjection(year_offset=1, amount=5000.0))
 
-    # Advanced: custom injection
     with st.sidebar.expander("➕ Add Custom Injection"):
         custom_amount = st.number_input("Custom Injection Amount (€)", min_value=0.0, step=500.0, value=0.0)
         custom_year_offset = st.number_input(
@@ -214,6 +281,13 @@ def main():
     early_retirement_age = st.sidebar.slider(
         "Early Retirement Age (for analysis)", min_value=current_age + 1, max_value=retirement_age, value=47
     )
+
+    # Monte Carlo controls
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎲 Monte Carlo Settings")
+    mc_runs = st.sidebar.number_input("Number of simulations", 100, 5000, 1000, step=100)
+    volatility_pct = st.sidebar.number_input("Annual Volatility (%)", 5.0, 40.0, 15.0, step=0.5)
+    annual_volatility = volatility_pct / 100.0
 
     # --- Build scenarios ---
 
@@ -276,11 +350,13 @@ def main():
 
     # Sidebar results
     with col_side:
-        st.subheader("🎯 FI Summary (Base Scenario)")
+        st.subheader("🎯 FI Summary (Base)")
 
-        st.metric("FI Number Today (in today's €)",
-                  f"€{base_result.fi_number_today:,.0f}",
-                  help="Annual spending / Safe Withdrawal Rate")
+        st.metric(
+            "FI Number Today (in today's €)",
+            f"€{base_result.fi_number_today:,.0f}",
+            help="Annual spending / Safe Withdrawal Rate",
+        )
 
         if base_result.fi_age is not None:
             st.success(f"✅ FI reached at age **{base_result.fi_age}**")
@@ -288,8 +364,10 @@ def main():
             st.error("FI not reached before retirement age in base scenario.")
 
         if base_result.coast_fi_age is not None:
-            st.info(f"🏖 Coast FI at age **{base_result.coast_fi_age}** "
-                    f"(you could stop investing then and still retire FI at {retirement_age}).")
+            st.info(
+                f"🏖 Coast FI at age **{base_result.coast_fi_age}** "
+                f"(you could stop investing then and still retire FI at {retirement_age})."
+            )
 
         st.markdown("---")
         st.subheader("💶 Passive Income at Retirement (Base)")
@@ -304,11 +382,12 @@ def main():
         st.markdown("---")
         st.subheader("🧓 Early Retirement Check")
 
-        # portfolio at early_retirement_age for base scenario
         early_row = next((yr for yr in base_result.years if yr.age == early_retirement_age), None)
         if early_row:
-            st.metric(f"Portfolio at age {early_retirement_age}",
-                      f"€{early_row.portfolio_end:,.0f}")
+            st.metric(
+                f"Portfolio at age {early_retirement_age}",
+                f"€{early_row.portfolio_end:,.0f}",
+            )
             if early_row.portfolio_end >= early_row.fi_number_this_year:
                 st.success("You are FI by this age ✅")
             else:
@@ -327,16 +406,18 @@ def main():
             }
         )
 
-        st.dataframe(df_base.style.format({"Portfolio (€)": "€{:,.0f}",
-                                           "FI Number (that year, €)": "€{:,.0f}"}),
-                     use_container_width=True)
+        st.dataframe(
+            df_base.style.format(
+                {"Portfolio (€)": "€{:,.0f}", "FI Number (that year, €)": "€{:,.0f}"}
+            ),
+            use_container_width=True,
+        )
 
         st.subheader("📈 Scenario Comparison")
 
-        # Build combined DF for chart
         chart_data = {}
-        ages = [y.age for y in base_result.years]
-        chart_data["Age"] = ages
+        ages_for_chart = [y.age for y in base_result.years]
+        chart_data["Age"] = ages_for_chart
 
         for res in scenarios:
             chart_data[f"{res.params.name} Portfolio"] = [y.portfolio_end for y in res.years]
@@ -353,7 +434,7 @@ def main():
         if base_result.fi_age is not None:
             st.markdown(
                 f"✅ In the **base scenario**, you reach **Financial Independence** at age "
-                f"**{base_result.fi_age}**, when your portfolio first crosses the inflation-adjusted "
+                f"**{base_result.fi_age}**, when your portfolio first crosses the (inflation-adjusted) "
                 f"FI number for that year."
             )
         else:
@@ -361,6 +442,52 @@ def main():
                 "❌ In the **base scenario**, you do **not** reach FI before your chosen retirement age. "
                 "Try increasing monthly investing, bonuses, or expected return, or lowering target spending."
             )
+
+        # --- Monte Carlo section ---
+        st.subheader("🎲 Monte Carlo Simulation (Base Scenario)")
+
+        mc = monte_carlo_simulation(
+            current_portfolio=current_portfolio,
+            monthly_invest=monthly_invest,
+            annual_bonus=annual_bonus_invest,
+            one_time_injections=one_time_injections,
+            current_age=current_age,
+            retirement_age=retirement_age,
+            annual_return=annual_return,
+            annual_volatility=annual_volatility,
+            runs=mc_runs,
+        )
+
+        mc_df = pd.DataFrame(
+            {
+                "Age": mc["ages"],
+                "Median": mc["median"],
+                "10th Percentile": mc["p10"],
+                "90th Percentile": mc["p90"],
+            }
+        ).set_index("Age")
+
+        st.line_chart(mc_df)
+
+        st.markdown(
+            """
+            - **Median** → typical path  
+            - **10th percentile** → bad markets  
+            - **90th percentile** → great markets  
+            """
+        )
+
+        # Probability of reaching FI by retirement
+        st.subheader("📊 Probability of Reaching FI by Retirement")
+
+        # FI number at retirement (inflation adjusted if enabled)
+        years_to_retirement = retirement_age - current_age
+        fi_number_at_retirement = base_result.fi_number_today * ((1 + inflation_rate) ** years_to_retirement)
+
+        final_values = mc["all_paths"][:, -1]  # portfolio at retirement for each simulation
+        prob_fi = (final_values >= fi_number_at_retirement).mean() * 100.0
+
+        st.metric("Probability of Reaching FI by Retirement", f"{prob_fi:.1f}%")
 
     st.markdown("---")
     st.caption("Built for Klaas' FI obsession 🧮. Change inputs on the left and watch your future move.")
