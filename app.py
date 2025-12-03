@@ -313,7 +313,7 @@ def main():
     )
 
     current_portfolio = st.sidebar.number_input(
-        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=44327.73, key="current_portfolio"
+        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=10000.00, key="current_portfolio"
     )
 
     monthly_invest = st.sidebar.number_input(
@@ -800,7 +800,7 @@ def main():
         st.metric("Probability of Reaching FI by Retirement", f"{prob_fi:.1f}%")
 
     st.markdown("---")
-    st.caption("Built for Klaas' FI obsession 🧮. Now with asset allocation realism.")
+    st.caption("Built for Klaas'obsession 🧮. Alex is Gay)
 
 
 if __name__ == "__main__":
