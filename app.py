@@ -16,6 +16,7 @@ class OneTimeInjection:
 
 @dataclass
 class ProjectionInput:
+    name: str
     current_age: int
     retirement_age: int
     current_portfolio: float
@@ -23,8 +24,9 @@ class ProjectionInput:
     annual_bonus_invest: float
     one_time_injections: List[OneTimeInjection]
     annual_return: float  # e.g. 0.065 for 6.5%
-    target_monthly_spend: float  # for FI calculation
+    target_monthly_spend: float  # for FI calculation (today's €)
     safe_withdrawal_rate: float = 0.04  # 4% rule by default
+    inflation_rate: float = 0.0         # optional inflation
 
 
 @dataclass
@@ -32,14 +34,17 @@ class YearResult:
     age: int
     year_index: int
     portfolio_end: float
+    fi_number_this_year: float
 
 
 @dataclass
 class ProjectionResult:
-    fi_number: float
+    params: ProjectionInput
+    fi_number_today: float
     fi_age: Optional[int]
     fi_year_index: Optional[int]
     years: List[YearResult]
+    coast_fi_age: Optional[int]
 
 
 # ---------- Core Logic ----------
@@ -47,7 +52,7 @@ class ProjectionResult:
 def run_projection(params: ProjectionInput) -> ProjectionResult:
     """
     Runs a yearly projection with monthly contributions, annual bonus,
-    and optional one-time injections.
+    optional one-time injections, and (optionally) inflation-adjusted FI.
     """
     monthly_rate = (1 + params.annual_return) ** (1 / 12) - 1
     current_portfolio = params.current_portfolio
@@ -61,6 +66,9 @@ def run_projection(params: ProjectionInput) -> ProjectionResult:
 
     years: List[YearResult] = []
 
+    annual_spend_today = params.target_monthly_spend * 12
+    fi_number_today = annual_spend_today / params.safe_withdrawal_rate
+
     for year_idx in range(1, num_years + 1):
         # 12 months of growth + monthly investing
         for _ in range(12):
@@ -73,27 +81,49 @@ def run_projection(params: ProjectionInput) -> ProjectionResult:
         if year_idx in injections_by_year:
             current_portfolio += injections_by_year[year_idx]
 
+        # FI number in nominal euros for this year (inflation adjustment)
+        fi_number_this_year = fi_number_today * ((1 + params.inflation_rate) ** year_idx)
+
         age = params.current_age + year_idx
-        years.append(YearResult(age=age, year_index=year_idx, portfolio_end=current_portfolio))
+        years.append(
+            YearResult(
+                age=age,
+                year_index=year_idx,
+                portfolio_end=current_portfolio,
+                fi_number_this_year=fi_number_this_year,
+            )
+        )
 
-    # FI calculations
-    annual_spend = params.target_monthly_spend * 12
-    fi_number = annual_spend / params.safe_withdrawal_rate
-
+    # Determine FI age (first year where portfolio >= FI number that year)
     fi_age: Optional[int] = None
     fi_year_index: Optional[int] = None
-
     for yr in years:
-        if yr.portfolio_end >= fi_number:
+        if yr.portfolio_end >= yr.fi_number_this_year:
             fi_age = yr.age
             fi_year_index = yr.year_index
             break
 
+    # Coast FI age: first age where, if you stop investing completely and
+    # just let the portfolio grow until retirement, you'll still hit FI at retirement.
+    coast_fi_age: Optional[int] = None
+    annual_rate = params.annual_return
+    # FI number at retirement in nominal terms
+    fi_number_at_retirement = fi_number_today * ((1 + params.inflation_rate) ** num_years)
+
+    for yr in years:
+        years_remaining = params.retirement_age - yr.age
+        future_portfolio = yr.portfolio_end * ((1 + annual_rate) ** years_remaining)
+        if future_portfolio >= fi_number_at_retirement:
+            coast_fi_age = yr.age
+            break
+
     return ProjectionResult(
-        fi_number=fi_number,
+        params=params,
+        fi_number_today=fi_number_today,
         fi_age=fi_age,
         fi_year_index=fi_year_index,
-        years=years
+        years=years,
+        coast_fi_age=coast_fi_age,
     )
 
 
@@ -120,7 +150,7 @@ def main():
     retirement_age = col2.number_input("Retirement Age", min_value=current_age + 1, max_value=80, value=67, step=1)
 
     current_portfolio = st.sidebar.number_input(
-        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=40000.10
+        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=44327.73
     )
 
     monthly_invest = st.sidebar.number_input(
@@ -148,6 +178,15 @@ def main():
     safe_withdrawal_rate = safe_withdrawal_rate_pct / 100.0
 
     st.sidebar.markdown("---")
+    st.sidebar.subheader("🧯 Inflation")
+
+    use_inflation = st.sidebar.checkbox("Adjust FI number for inflation", value=True)
+    inflation_rate_pct = st.sidebar.number_input(
+        "Inflation Rate (%)", min_value=0.0, max_value=10.0, value=2.0, step=0.25
+    )
+    inflation_rate = (inflation_rate_pct / 100.0) if use_inflation else 0.0
+
+    st.sidebar.markdown("---")
     st.sidebar.subheader("🎁 One-Time Extra Injection")
 
     extra_5k_enabled = st.sidebar.checkbox("Include one-time €5k next year", value=True)
@@ -160,15 +199,27 @@ def main():
     with st.sidebar.expander("➕ Add Custom Injection"):
         custom_amount = st.number_input("Custom Injection Amount (€)", min_value=0.0, step=500.0, value=0.0)
         custom_year_offset = st.number_input(
-            "Year Offset (1 = end of this year)", min_value=1, max_value=max(1, retirement_age - current_age),
-            value=2, step=1
+            "Year Offset (1 = end of first projected year)",
+            min_value=1,
+            max_value=max(1, retirement_age - current_age),
+            value=2,
+            step=1,
         )
         if custom_amount > 0:
-            one_time_injections.append(OneTimeInjection(year_offset=int(custom_year_offset), amount=custom_amount))
+            one_time_injections.append(
+                OneTimeInjection(year_offset=int(custom_year_offset), amount=custom_amount)
+            )
 
-    # --- Run Projection ---
+    # Early retirement slider
+    early_retirement_age = st.sidebar.slider(
+        "Early Retirement Age (for analysis)", min_value=current_age + 1, max_value=retirement_age, value=47
+    )
 
-    params = ProjectionInput(
+    # --- Build scenarios ---
+
+    # Base scenario
+    base_params = ProjectionInput(
+        name="Base",
         current_age=current_age,
         retirement_age=retirement_age,
         current_portfolio=current_portfolio,
@@ -177,68 +228,143 @@ def main():
         one_time_injections=one_time_injections,
         annual_return=annual_return,
         target_monthly_spend=target_monthly_spend,
-        safe_withdrawal_rate=safe_withdrawal_rate
+        safe_withdrawal_rate=safe_withdrawal_rate,
+        inflation_rate=inflation_rate,
     )
 
-    result = run_projection(params)
+    # Conservative scenario: lower return
+    cons_params = ProjectionInput(
+        name="Conservative",
+        current_age=current_age,
+        retirement_age=retirement_age,
+        current_portfolio=current_portfolio,
+        monthly_invest=monthly_invest,
+        annual_bonus_invest=annual_bonus_invest,
+        one_time_injections=one_time_injections,
+        annual_return=max(0.0, annual_return - 0.02),
+        target_monthly_spend=target_monthly_spend,
+        safe_withdrawal_rate=safe_withdrawal_rate,
+        inflation_rate=inflation_rate,
+    )
+
+    # Aggressive scenario: higher return
+    aggr_params = ProjectionInput(
+        name="Aggressive",
+        current_age=current_age,
+        retirement_age=retirement_age,
+        current_portfolio=current_portfolio,
+        monthly_invest=monthly_invest,
+        annual_bonus_invest=annual_bonus_invest,
+        one_time_injections=one_time_injections,
+        annual_return=annual_return + 0.02,
+        target_monthly_spend=target_monthly_spend,
+        safe_withdrawal_rate=safe_withdrawal_rate,
+        inflation_rate=inflation_rate,
+    )
+
+    scenarios = [
+        run_projection(base_params),
+        run_projection(cons_params),
+        run_projection(aggr_params),
+    ]
+
+    base_result = scenarios[0]
 
     # --- Outputs ---
 
-    col_main, col_side = st.columns([2, 1])
+    col_main, col_side = st.columns([2.2, 0.8])
 
+    # Sidebar results
     with col_side:
-        st.subheader("🎯 FI Summary")
+        st.subheader("🎯 FI Summary (Base Scenario)")
 
-        st.metric("FI Number (Portfolio Needed)",
-                  f"€{result.fi_number:,.0f}",
+        st.metric("FI Number Today (in today's €)",
+                  f"€{base_result.fi_number_today:,.0f}",
                   help="Annual spending / Safe Withdrawal Rate")
 
-        if result.fi_age is not None:
-            st.success(f"✅ FI reached at age **{result.fi_age}**")
+        if base_result.fi_age is not None:
+            st.success(f"✅ FI reached at age **{base_result.fi_age}**")
         else:
-            st.error("FI not reached before retirement age with current inputs.")
+            st.error("FI not reached before retirement age in base scenario.")
+
+        if base_result.coast_fi_age is not None:
+            st.info(f"🏖 Coast FI at age **{base_result.coast_fi_age}** "
+                    f"(you could stop investing then and still retire FI at {retirement_age}).")
 
         st.markdown("---")
-        st.subheader("💶 Passive Income at Retirement")
+        st.subheader("💶 Passive Income at Retirement (Base)")
 
-        if result.years:
-            final_portfolio = result.years[-1].portfolio_end
+        if base_result.years:
+            final_portfolio = base_result.years[-1].portfolio_end
             passive_income = final_portfolio * safe_withdrawal_rate
             st.metric("Portfolio at Retirement", f"€{final_portfolio:,.0f}")
             st.metric("Annual Safe Income", f"€{passive_income:,.0f}")
             st.metric("Monthly Safe Income", f"€{passive_income / 12:,.0f}")
 
-    with col_main:
-        st.subheader("📊 Year-by-Year Projection")
+        st.markdown("---")
+        st.subheader("🧓 Early Retirement Check")
 
-        df = pd.DataFrame(
+        # portfolio at early_retirement_age for base scenario
+        early_row = next((yr for yr in base_result.years if yr.age == early_retirement_age), None)
+        if early_row:
+            st.metric(f"Portfolio at age {early_retirement_age}",
+                      f"€{early_row.portfolio_end:,.0f}")
+            if early_row.portfolio_end >= early_row.fi_number_this_year:
+                st.success("You are FI by this age ✅")
+            else:
+                st.warning("Not FI yet at this age ❌")
+
+    # Main section
+    with col_main:
+        st.subheader("📊 Year-by-Year Projection (Base Scenario)")
+
+        df_base = pd.DataFrame(
             {
-                "Year Index": [y.year_index for y in result.years],
-                "Age": [y.age for y in result.years],
-                "Portfolio (€)": [y.portfolio_end for y in result.years],
+                "Year Index": [y.year_index for y in base_result.years],
+                "Age": [y.age for y in base_result.years],
+                "Portfolio (€)": [y.portfolio_end for y in base_result.years],
+                "FI Number (that year, €)": [y.fi_number_this_year for y in base_result.years],
             }
         )
 
-        st.dataframe(df.style.format({"Portfolio (€)": "€{:,.0f}"}), use_container_width=True)
+        st.dataframe(df_base.style.format({"Portfolio (€)": "€{:,.0f}",
+                                           "FI Number (that year, €)": "€{:,.0f}"}),
+                     use_container_width=True)
 
-        st.subheader("📈 Growth Chart")
-        st.line_chart(df.set_index("Age")["Portfolio (€)"])
+        st.subheader("📈 Scenario Comparison")
 
-        if result.fi_age is not None:
+        # Build combined DF for chart
+        chart_data = {}
+        ages = [y.age for y in base_result.years]
+        chart_data["Age"] = ages
+
+        for res in scenarios:
+            chart_data[f"{res.params.name} Portfolio"] = [y.portfolio_end for y in res.years]
+
+        chart_df = pd.DataFrame(chart_data).set_index("Age")
+        st.line_chart(chart_df)
+
+        st.markdown(
+            "- **Base**: your chosen return.\n"
+            "- **Conservative**: return - 2 percentage points.\n"
+            "- **Aggressive**: return + 2 percentage points.\n"
+        )
+
+        if base_result.fi_age is not None:
             st.markdown(
-                f"✅ You reach **Financial Independence** at age **{result.fi_age}** "
-                f"when your portfolio first crosses **€{result.fi_number:,.0f}**."
+                f"✅ In the **base scenario**, you reach **Financial Independence** at age "
+                f"**{base_result.fi_age}**, when your portfolio first crosses the inflation-adjusted "
+                f"FI number for that year."
             )
         else:
             st.markdown(
-                "❌ With the current parameters, you do **not** reach FI before retirement age. "
-                "Try increasing monthly investing, bonuses, or expected return."
+                "❌ In the **base scenario**, you do **not** reach FI before your chosen retirement age. "
+                "Try increasing monthly investing, bonuses, or expected return, or lowering target spending."
             )
 
     st.markdown("---")
-    st.caption("Built for Klaas' FI obsession. Change inputs on the left and watch your future move.")
+    st.caption("Built for Klaas' FI obsession 🧮. Change inputs on the left and watch your future move.")
 
 
 if __name__ == "__main__":
     main()
-
