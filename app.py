@@ -37,6 +37,8 @@ class ProjectionInput:
     target_monthly_spend: float  # for FI calculation (today's €)
     safe_withdrawal_rate: float = 0.04  # 4% rule by default
     inflation_rate: float = 0.0         # optional inflation per year
+    crash_year_offset: Optional[int] = None  # 1-based: year of crash
+    crash_drawdown: float = 0.0               # e.g. 0.37 for -37%
 
 
 @dataclass
@@ -62,9 +64,9 @@ class ProjectionResult:
 def run_projection(params: ProjectionInput) -> ProjectionResult:
     """
     Runs a yearly projection with monthly contributions, annual bonus,
-    optional one-time injections, and (optionally) inflation-adjusted FI.
+    optional one-time injections, optional inflation-adjusted FI,
+    and optional crash in a given year (applied after that year's contributions).
     """
-    monthly_rate = (1 + params.annual_return) ** (1 / 12) - 1
     current_portfolio = params.current_portfolio
     num_years = params.retirement_age - params.current_age
 
@@ -80,6 +82,10 @@ def run_projection(params: ProjectionInput) -> ProjectionResult:
     fi_number_today = annual_spend_today / params.safe_withdrawal_rate
 
     for year_idx in range(1, num_years + 1):
+        # Allow per-year override of return (for crash, etc.)
+        annual_rate_this_year = params.annual_return
+        monthly_rate = (1 + annual_rate_this_year) ** (1 / 12) - 1
+
         # 12 months of growth + monthly investing
         for _ in range(12):
             current_portfolio = current_portfolio * (1 + monthly_rate) + params.monthly_invest
@@ -90,6 +96,11 @@ def run_projection(params: ProjectionInput) -> ProjectionResult:
         # Add any one-time injections scheduled at this year
         if year_idx in injections_by_year:
             current_portfolio += injections_by_year[year_idx]
+
+        # Apply crash drawdown AFTER contributions in that year
+        if params.crash_year_offset is not None and params.crash_year_offset == year_idx:
+            if params.crash_drawdown > 0:
+                current_portfolio *= (1.0 - params.crash_drawdown)
 
         # FI number in nominal euros for this year (inflation adjustment)
         fi_number_this_year = fi_number_today * ((1 + params.inflation_rate) ** year_idx)
@@ -117,8 +128,9 @@ def run_projection(params: ProjectionInput) -> ProjectionResult:
     # just let the portfolio grow until retirement, you'll still hit FI at retirement.
     coast_fi_age: Optional[int] = None
     annual_rate = params.annual_return
+    num_years_total = num_years
     # FI number at retirement in nominal terms
-    fi_number_at_retirement = fi_number_today * ((1 + params.inflation_rate) ** num_years)
+    fi_number_at_retirement = fi_number_today * ((1 + params.inflation_rate) ** num_years_total)
 
     for yr in years:
         years_remaining = params.retirement_age - yr.age
@@ -148,11 +160,15 @@ def monte_carlo_simulation(
     retirement_age: int,
     annual_return: float,
     annual_volatility: float,
+    crash_year_offset: Optional[int] = None,
+    crash_drawdown: float = 0.0,
     runs: int = 1000,
 ):
     """
     Monte Carlo simulation of future portfolio values.
     annual_return and annual_volatility are decimals (0.065, 0.15).
+    crash_year_offset is 1-based index of the projected year where a crash happens
+    with drawdown 'crash_drawdown' (0.37 = -37%).
     Returns:
         {
             "ages": [age1, age2, ...],
@@ -189,6 +205,11 @@ def monte_carlo_simulation(
             if (y + 1) in injections_by_year:
                 value += injections_by_year[y + 1]
 
+            # If this is the crash year, apply drawdown AFTER contributions
+            if crash_year_offset is not None and crash_year_offset == (y + 1):
+                if crash_drawdown > 0:
+                    value *= (1.0 - crash_drawdown)
+
             all_paths[r, y] = value
 
     median_curve = np.median(all_paths, axis=0)
@@ -204,6 +225,60 @@ def monte_carlo_simulation(
     }
 
 
+# ---------- Asset Allocation Engine ----------
+
+def compute_portfolio_from_allocation(weights_pct: dict):
+    """
+    weights_pct: dict with keys 'stocks','bonds','reit','gold','cash' in %
+    Returns (expected_return, volatility)
+    """
+
+    # Convert to array and normalize
+    labels = ["stocks", "bonds", "reit", "gold", "cash"]
+    w = np.array([weights_pct.get(k, 0.0) for k in labels], dtype=float)
+    total = w.sum()
+    if total <= 0:
+        # fallback: all cash, 0 return, 0 vol
+        return 0.0, 0.0
+    w = w / total
+
+    # Reasonable long-term assumptions (real-ish, but simple)
+    # Annual expected returns
+    mu = np.array([
+        0.07,  # stocks
+        0.02,  # bonds
+        0.06,  # REIT
+        0.03,  # gold
+        0.01,  # cash
+    ])
+
+    # Annual volatilities
+    sigma = np.array([
+        0.18,  # stocks
+        0.06,  # bonds
+        0.16,  # REIT
+        0.15,  # gold
+        0.01,  # cash
+    ])
+
+    # Correlation matrix (roughly realistic structure)
+    corr = np.array([
+        [1.00,  0.10, 0.70, 0.20, 0.00],
+        [0.10,  1.00, 0.20, 0.00, 0.10],
+        [0.70,  0.20, 1.00, 0.25, 0.00],
+        [0.20,  0.00, 0.25, 1.00, 0.00],
+        [0.00,  0.10, 0.00, 0.00, 1.00],
+    ])
+
+    cov = np.outer(sigma, sigma) * corr
+
+    expected_return = float(w @ mu)
+    variance = float(w @ cov @ w)
+    volatility = math.sqrt(variance)
+
+    return expected_return, volatility
+
+
 # ---------- Streamlit UI ----------
 
 def main():
@@ -214,13 +289,13 @@ def main():
         """
         This tool projects your portfolio year by year, calculates your **FI number**,  
         estimates your **FI age**, **Coast FI age**, and runs a **Monte Carlo simulation**  
-        to show how market randomness affects your future.
+        including an optional **historical crash scenario** and an **asset allocation engine**.
         """
     )
 
     # --- Inputs ---
 
-    st.sidebar.header("🔧 Inputs")
+    st.sidebar.header("🔧 Basic Inputs")
 
     # All inputs with keys so they can be saved/loaded
 
@@ -250,9 +325,10 @@ def main():
     )
 
     st.sidebar.markdown("---")
+    st.sidebar.subheader("🎯 FI Target")
 
-    annual_return_pct = st.sidebar.number_input(
-        "Expected Annual Return (%)",
+    annual_return_pct_manual = st.sidebar.number_input(
+        "Expected Annual Return (manual, %)",
         min_value=0.0,
         max_value=20.0,
         value=6.5,
@@ -289,6 +365,68 @@ def main():
         step=0.25,
         key="inflation_pct",
     )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📊 Asset Allocation Engine")
+
+    use_allocation = st.sidebar.checkbox(
+        "Use asset allocation to set return & volatility", value=True, key="use_allocation"
+    )
+
+    # allocation sliders (in %)
+    aa_stocks = st.sidebar.slider("Stocks (%)", 0, 100, 80, step=5, key="aa_stocks")
+    aa_bonds = st.sidebar.slider("Bonds (%)", 0, 100, 10, step=5, key="aa_bonds")
+    aa_reit = st.sidebar.slider("REITs (%)", 0, 100, 5, step=5, key="aa_reit")
+    aa_gold = st.sidebar.slider("Gold (%)", 0, 100, 5, step=5, key="aa_gold")
+    aa_cash = st.sidebar.slider("Cash (%)", 0, 100, 0, step=5, key="aa_cash")
+
+    alloc_total = aa_stocks + aa_bonds + aa_reit + aa_gold + aa_cash
+    st.sidebar.caption(f"Total allocation: **{alloc_total}%** (normalized internally).")
+
+    alloc_dict = {
+        "stocks": aa_stocks,
+        "bonds": aa_bonds,
+        "reit": aa_reit,
+        "gold": aa_gold,
+        "cash": aa_cash,
+    }
+
+    alloc_return, alloc_vol = compute_portfolio_from_allocation(alloc_dict)
+
+    if use_allocation:
+        annual_return = alloc_return
+        annual_return_pct_display = annual_return * 100
+    else:
+        annual_return = annual_return_pct_manual / 100.0
+        annual_return_pct_display = annual_return_pct_manual
+
+    st.sidebar.metric(
+        "Effective Annual Return (%)",
+        f"{annual_return_pct_display:.2f}",
+        help="Either from asset allocation or manual input.",
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🧨 Historical Crash Scenario")
+
+    simulate_crash = st.sidebar.checkbox("Enable crash scenario", value=False, key="simulate_crash")
+    crash_year_offset = None
+    crash_drawdown = 0.0
+    if simulate_crash:
+        # 1 = first projected year (end of this year)
+        max_year_offset = max(1, st.session_state.retirement_age - st.session_state.current_age)
+        crash_year_offset = st.sidebar.number_input(
+            "Crash year offset (1 = first projected year)",
+            min_value=1,
+            max_value=max_year_offset,
+            value=5,
+            step=1,
+            key="crash_year_offset",
+        )
+        crash_drawdown_pct = st.sidebar.number_input(
+            "Crash drawdown (%)", min_value=5.0, max_value=90.0, value=37.0, step=1.0, key="crash_drawdown_pct"
+        )
+        crash_drawdown = crash_drawdown_pct / 100.0
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("🎁 One-Time Extra Injection")
@@ -328,13 +466,27 @@ def main():
     mc_runs = st.sidebar.number_input(
         "Number of simulations", 100, 5000, 1000, step=100, key="mc_runs"
     )
-    volatility_pct = st.sidebar.number_input(
-        "Annual Volatility (%)",
-        5.0,
-        40.0,
+
+    volatility_pct_manual = st.sidebar.number_input(
+        "Annual Volatility (manual, %)",
+        1.0,
+        50.0,
         15.0,
         step=0.5,
         key="volatility_pct",
+    )
+
+    if use_allocation:
+        annual_volatility = alloc_vol
+        volatility_pct_display = annual_volatility * 100
+    else:
+        annual_volatility = volatility_pct_manual / 100.0
+        volatility_pct_display = volatility_pct_manual
+
+    st.sidebar.metric(
+        "Effective Volatility (%)",
+        f"{volatility_pct_display:.2f}",
+        help="Either from asset allocation or manual input.",
     )
 
     # --- Save/Load Scenarios ---
@@ -374,6 +526,15 @@ def main():
                 "early_ret_age": st.session_state.early_ret_age,
                 "mc_runs": st.session_state.mc_runs,
                 "volatility_pct": st.session_state.volatility_pct,
+                "simulate_crash": st.session_state.simulate_crash,
+                "crash_year_offset": st.session_state.get("crash_year_offset"),
+                "crash_drawdown_pct": st.session_state.get("crash_drawdown_pct", 37.0),
+                "use_allocation": st.session_state.use_allocation,
+                "aa_stocks": st.session_state.aa_stocks,
+                "aa_bonds": st.session_state.aa_bonds,
+                "aa_reit": st.session_state.aa_reit,
+                "aa_gold": st.session_state.aa_gold,
+                "aa_cash": st.session_state.aa_cash,
             }
             st.session_state["active_scenario"] = scenario_name.strip()
             st.sidebar.success(f"Saved scenario '{scenario_name.strip()}'")
@@ -404,13 +565,33 @@ def main():
     current_portfolio = st.session_state.current_portfolio
     monthly_invest = st.session_state.monthly_invest
     annual_bonus_invest = st.session_state.annual_bonus
-    annual_return = st.session_state.annual_return_pct / 100.0
     target_monthly_spend = st.session_state.target_monthly_spend
     safe_withdrawal_rate = st.session_state.swr_pct / 100.0
     inflation_rate = (st.session_state.inflation_pct / 100.0) if st.session_state.use_inflation else 0.0
     early_retirement_age = st.session_state.early_ret_age
     mc_runs = int(st.session_state.mc_runs)
-    annual_volatility = st.session_state.volatility_pct / 100.0
+    simulate_crash = st.session_state.simulate_crash
+    use_allocation = st.session_state.use_allocation
+
+    # recompute allocation-based return & vol (in case loaded)
+    alloc_dict_loaded = {
+        "stocks": st.session_state.aa_stocks,
+        "bonds": st.session_state.aa_bonds,
+        "reit": st.session_state.aa_reit,
+        "gold": st.session_state.aa_gold,
+        "cash": st.session_state.aa_cash,
+    }
+    alloc_return_loaded, alloc_vol_loaded = compute_portfolio_from_allocation(alloc_dict_loaded)
+
+    if use_allocation:
+        annual_return = alloc_return_loaded
+        annual_volatility = alloc_vol_loaded
+    else:
+        annual_return = st.session_state.annual_return_pct / 100.0
+        annual_volatility = st.session_state.volatility_pct / 100.0
+
+    crash_year_offset = st.session_state.get("crash_year_offset") if simulate_crash else None
+    crash_drawdown = (st.session_state.get("crash_drawdown_pct", 37.0) / 100.0) if simulate_crash else 0.0
 
     # --- Build scenarios ---
 
@@ -426,6 +607,8 @@ def main():
         target_monthly_spend=target_monthly_spend,
         safe_withdrawal_rate=safe_withdrawal_rate,
         inflation_rate=inflation_rate,
+        crash_year_offset=crash_year_offset,
+        crash_drawdown=crash_drawdown,
     )
 
     cons_params = ProjectionInput(
@@ -440,6 +623,8 @@ def main():
         target_monthly_spend=target_monthly_spend,
         safe_withdrawal_rate=safe_withdrawal_rate,
         inflation_rate=inflation_rate,
+        crash_year_offset=crash_year_offset,
+        crash_drawdown=crash_drawdown,
     )
 
     aggr_params = ProjectionInput(
@@ -454,6 +639,8 @@ def main():
         target_monthly_spend=target_monthly_spend,
         safe_withdrawal_rate=safe_withdrawal_rate,
         inflation_rate=inflation_rate,
+        crash_year_offset=crash_year_offset,
+        crash_drawdown=crash_drawdown,
     )
 
     scenarios = [
@@ -546,9 +733,10 @@ def main():
         st.line_chart(chart_df)
 
         st.markdown(
-            "- **Base**: your chosen return.\n"
+            "- **Base**: your chosen (or allocation-derived) return.\n"
             "- **Conservative**: return - 2 percentage points.\n"
             "- **Aggressive**: return + 2 percentage points.\n"
+            "- Crash (if enabled) is applied in the chosen year **after** contributions."
         )
 
         if base_result.fi_age is not None:
@@ -575,6 +763,8 @@ def main():
             retirement_age=retirement_age,
             annual_return=annual_return,
             annual_volatility=annual_volatility,
+            crash_year_offset=crash_year_offset,
+            crash_drawdown=crash_drawdown,
             runs=mc_runs,
         )
 
@@ -594,6 +784,7 @@ def main():
             - **Median** → typical path  
             - **10th percentile** → bad markets  
             - **90th percentile** → great markets  
+            - If crash is enabled, **all paths** include that crash in the chosen year.
             """
         )
 
@@ -609,7 +800,7 @@ def main():
         st.metric("Probability of Reaching FI by Retirement", f"{prob_fi:.1f}%")
 
     st.markdown("---")
-    st.caption("Built for Klaas' FI obsession 🧮. Change inputs on the left and watch your future move.")
+    st.caption("Built for Klaas' FI obsession 🧮. Now with asset allocation realism.")
 
 
 if __name__ == "__main__":
