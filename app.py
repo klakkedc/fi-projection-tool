@@ -313,7 +313,7 @@ def main():
     )
 
     current_portfolio = st.sidebar.number_input(
-        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=44327.73, key="current_portfolio"
+        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=10000.00, key="current_portfolio"
     )
 
     monthly_invest = st.sidebar.number_input(
@@ -805,3 +805,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
