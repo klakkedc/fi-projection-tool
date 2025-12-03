@@ -7,6 +7,15 @@ import pandas as pd
 import streamlit as st
 
 
+# ---------- Session State Setup ----------
+
+if "scenarios" not in st.session_state:
+    st.session_state["scenarios"] = {}  # name -> dict of parameters
+
+if "active_scenario" not in st.session_state:
+    st.session_state["active_scenario"] = None
+
+
 # ---------- Data Models ----------
 
 @dataclass
@@ -213,85 +222,198 @@ def main():
 
     st.sidebar.header("🔧 Inputs")
 
+    # All inputs with keys so they can be saved/loaded
+
     col1, col2 = st.sidebar.columns(2)
-    current_age = col1.number_input("Current Age", min_value=16, max_value=80, value=27, step=1)
-    retirement_age = col2.number_input("Retirement Age", min_value=current_age + 1, max_value=80, value=67, step=1)
+    current_age = col1.number_input(
+        "Current Age", min_value=16, max_value=80, value=27, step=1, key="current_age"
+    )
+    retirement_age = col2.number_input(
+        "Retirement Age",
+        min_value=st.session_state.current_age + 1,
+        max_value=80,
+        value=67,
+        step=1,
+        key="retirement_age",
+    )
 
     current_portfolio = st.sidebar.number_input(
-        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=40000.00
+        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=44327.73, key="current_portfolio"
     )
 
     monthly_invest = st.sidebar.number_input(
-        "Monthly Investment (€)", min_value=0.0, step=50.0, value=1000.0
+        "Monthly Investment (€)", min_value=0.0, step=50.0, value=1000.0, key="monthly_invest"
     )
 
     annual_bonus_invest = st.sidebar.number_input(
-        "Annual Bonus Invested (€)", min_value=0.0, step=500.0, value=5000.0
+        "Annual Bonus Invested (€)", min_value=0.0, step=500.0, value=5000.0, key="annual_bonus"
     )
 
     st.sidebar.markdown("---")
 
     annual_return_pct = st.sidebar.number_input(
-        "Expected Annual Return (%)", min_value=0.0, max_value=20.0, value=6.5, step=0.1
+        "Expected Annual Return (%)",
+        min_value=0.0,
+        max_value=20.0,
+        value=6.5,
+        step=0.1,
+        key="annual_return_pct",
     )
-    annual_return = annual_return_pct / 100.0
 
     target_monthly_spend = st.sidebar.number_input(
-        "Target Monthly Spend at FI (€)", min_value=500.0, step=100.0, value=3000.0
+        "Target Monthly Spend at FI (€)",
+        min_value=500.0,
+        step=100.0,
+        value=3000.0,
+        key="target_monthly_spend",
     )
 
     safe_withdrawal_rate_pct = st.sidebar.number_input(
-        "Safe Withdrawal Rate (%)", min_value=2.0, max_value=6.0, value=4.0, step=0.25
+        "Safe Withdrawal Rate (%)",
+        min_value=2.0,
+        max_value=6.0,
+        value=4.0,
+        step=0.25,
+        key="swr_pct",
     )
-    safe_withdrawal_rate = safe_withdrawal_rate_pct / 100.0
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧯 Inflation")
 
-    use_inflation = st.sidebar.checkbox("Adjust FI number for inflation", value=True)
+    use_inflation = st.sidebar.checkbox("Adjust FI number for inflation", value=True, key="use_inflation")
     inflation_rate_pct = st.sidebar.number_input(
-        "Inflation Rate (%)", min_value=0.0, max_value=10.0, value=2.0, step=0.25
+        "Inflation Rate (%)",
+        min_value=0.0,
+        max_value=10.0,
+        value=2.0,
+        step=0.25,
+        key="inflation_pct",
     )
-    inflation_rate = (inflation_rate_pct / 100.0) if use_inflation else 0.0
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("🎁 One-Time Extra Injection")
 
-    extra_5k_enabled = st.sidebar.checkbox("Include one-time €5k next year", value=True)
+    extra_5k_enabled = st.sidebar.checkbox("Include one-time €5k next year", value=True, key="extra_5k")
     one_time_injections: List[OneTimeInjection] = []
-    if extra_5k_enabled:
-        # year_offset = 1 means: at the end of the first projected year
+    if st.session_state.extra_5k:
         one_time_injections.append(OneTimeInjection(year_offset=1, amount=5000.0))
 
     with st.sidebar.expander("➕ Add Custom Injection"):
-        custom_amount = st.number_input("Custom Injection Amount (€)", min_value=0.0, step=500.0, value=0.0)
+        custom_amount = st.number_input(
+            "Custom Injection Amount (€)", min_value=0.0, step=500.0, value=0.0, key="custom_inj_amount"
+        )
         custom_year_offset = st.number_input(
             "Year Offset (1 = end of first projected year)",
             min_value=1,
-            max_value=max(1, retirement_age - current_age),
+            max_value=max(1, st.session_state.retirement_age - st.session_state.current_age),
             value=2,
             step=1,
+            key="custom_inj_year",
         )
         if custom_amount > 0:
             one_time_injections.append(
-                OneTimeInjection(year_offset=int(custom_year_offset), amount=custom_amount)
+                OneTimeInjection(year_offset=int(st.session_state.custom_inj_year), amount=custom_amount)
             )
 
-    # Early retirement slider
     early_retirement_age = st.sidebar.slider(
-        "Early Retirement Age (for analysis)", min_value=current_age + 1, max_value=retirement_age, value=47
+        "Early Retirement Age (for analysis)",
+        min_value=st.session_state.current_age + 1,
+        max_value=st.session_state.retirement_age,
+        value=47,
+        key="early_ret_age",
     )
 
-    # Monte Carlo controls
     st.sidebar.markdown("---")
     st.sidebar.subheader("🎲 Monte Carlo Settings")
-    mc_runs = st.sidebar.number_input("Number of simulations", 100, 5000, 1000, step=100)
-    volatility_pct = st.sidebar.number_input("Annual Volatility (%)", 5.0, 40.0, 15.0, step=0.5)
-    annual_volatility = volatility_pct / 100.0
+    mc_runs = st.sidebar.number_input(
+        "Number of simulations", 100, 5000, 1000, step=100, key="mc_runs"
+    )
+    volatility_pct = st.sidebar.number_input(
+        "Annual Volatility (%)",
+        5.0,
+        40.0,
+        15.0,
+        step=0.5,
+        key="volatility_pct",
+    )
+
+    # --- Save/Load Scenarios ---
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("💾 Save / Load Scenarios")
+
+    scenario_name = st.sidebar.text_input(
+        "Scenario name", value=st.session_state.get("active_scenario") or ""
+    )
+
+    saved_names = list(st.session_state["scenarios"].keys())
+    load_choice = st.sidebar.selectbox(
+        "Load existing scenario",
+        options=["(none)"] + saved_names,
+        index=0,
+    )
+
+    col_save, col_delete = st.sidebar.columns(2)
+
+    if col_save.button("Save scenario"):
+        if scenario_name.strip():
+            st.session_state["scenarios"][scenario_name.strip()] = {
+                "current_age": st.session_state.current_age,
+                "retirement_age": st.session_state.retirement_age,
+                "current_portfolio": st.session_state.current_portfolio,
+                "monthly_invest": st.session_state.monthly_invest,
+                "annual_bonus": st.session_state.annual_bonus,
+                "annual_return_pct": st.session_state.annual_return_pct,
+                "target_monthly_spend": st.session_state.target_monthly_spend,
+                "swr_pct": st.session_state.swr_pct,
+                "use_inflation": st.session_state.use_inflation,
+                "inflation_pct": st.session_state.inflation_pct,
+                "extra_5k": st.session_state.extra_5k,
+                "custom_inj_amount": st.session_state.custom_inj_amount,
+                "custom_inj_year": st.session_state.custom_inj_year,
+                "early_ret_age": st.session_state.early_ret_age,
+                "mc_runs": st.session_state.mc_runs,
+                "volatility_pct": st.session_state.volatility_pct,
+            }
+            st.session_state["active_scenario"] = scenario_name.strip()
+            st.sidebar.success(f"Saved scenario '{scenario_name.strip()}'")
+        else:
+            st.sidebar.error("Please enter a scenario name.")
+
+    if col_delete.button("Delete scenario"):
+        if load_choice != "(none)" and load_choice in st.session_state["scenarios"]:
+            del st.session_state["scenarios"][load_choice]
+            if st.session_state.get("active_scenario") == load_choice:
+                st.session_state["active_scenario"] = None
+            st.sidebar.success(f"Deleted scenario '{load_choice}'")
+        else:
+            st.sidebar.warning("Select a scenario to delete.")
+
+    if load_choice != "(none)" and load_choice in st.session_state["scenarios"]:
+        if st.sidebar.button("Load selected scenario"):
+            data = st.session_state["scenarios"][load_choice]
+            for key, val in data.items():
+                st.session_state[key] = val
+            st.session_state["active_scenario"] = load_choice
+            st.experimental_rerun()
+
+    # --- Pull values from session_state into local variables ---
+
+    current_age = st.session_state.current_age
+    retirement_age = st.session_state.retirement_age
+    current_portfolio = st.session_state.current_portfolio
+    monthly_invest = st.session_state.monthly_invest
+    annual_bonus_invest = st.session_state.annual_bonus
+    annual_return = st.session_state.annual_return_pct / 100.0
+    target_monthly_spend = st.session_state.target_monthly_spend
+    safe_withdrawal_rate = st.session_state.swr_pct / 100.0
+    inflation_rate = (st.session_state.inflation_pct / 100.0) if st.session_state.use_inflation else 0.0
+    early_retirement_age = st.session_state.early_ret_age
+    mc_runs = int(st.session_state.mc_runs)
+    annual_volatility = st.session_state.volatility_pct / 100.0
 
     # --- Build scenarios ---
 
-    # Base scenario
     base_params = ProjectionInput(
         name="Base",
         current_age=current_age,
@@ -306,7 +428,6 @@ def main():
         inflation_rate=inflation_rate,
     )
 
-    # Conservative scenario: lower return
     cons_params = ProjectionInput(
         name="Conservative",
         current_age=current_age,
@@ -321,7 +442,6 @@ def main():
         inflation_rate=inflation_rate,
     )
 
-    # Aggressive scenario: higher return
     aggr_params = ProjectionInput(
         name="Aggressive",
         current_age=current_age,
@@ -344,7 +464,7 @@ def main():
 
     base_result = scenarios[0]
 
-    # --- Outputs ---
+    # --- Layout ---
 
     col_main, col_side = st.columns([2.2, 0.8])
 
@@ -480,7 +600,6 @@ def main():
         # Probability of reaching FI by retirement
         st.subheader("📊 Probability of Reaching FI by Retirement")
 
-        # FI number at retirement (inflation adjusted if enabled)
         years_to_retirement = retirement_age - current_age
         fi_number_at_retirement = base_result.fi_number_today * ((1 + inflation_rate) ** years_to_retirement)
 
