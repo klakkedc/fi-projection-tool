@@ -120,7 +120,7 @@ def main():
     retirement_age = col2.number_input("Retirement Age", min_value=current_age + 1, max_value=80, value=67, step=1)
 
     current_portfolio = st.sidebar.number_input(
-        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=44327.73
+        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=40000.10
     )
 
     monthly_invest = st.sidebar.number_input(
@@ -241,3 +241,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
