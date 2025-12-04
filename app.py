@@ -293,37 +293,30 @@ ASSET_CLASSES = ["Stocks", "Bonds", "REIT", "Gold", "Cash"]
 
 def fetch_prices_for_portfolio(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Takes a DataFrame with columns ['Ticker','Shares', 'Class'] and
-    returns a new DataFrame with Price, Value, and Weight.
+    Very simple price fetch: 1d history per ticker, no caching.
+    Shows warnings in the app if something fails.
     """
     df = df.copy()
-    tickers = df["Ticker"].astype(str).str.strip()
-    tickers_nonempty = tickers[tickers != ""].tolist()
-
-    if not tickers_nonempty:
-        df["Price"] = 0.0
-        df["Value"] = 0.0
-        df["Weight"] = 0.0
-        return df
-
-    try:
-        price_data = yf.download(tickers_nonempty, period="1d", progress=False)["Adj Close"]
-        # If only one ticker, price_data is a Series
-        if isinstance(price_data, pd.Series):
-            latest_prices = price_data.iloc[-1:].to_dict()
-        else:
-            latest_row = price_data.iloc[-1]
-            latest_prices = latest_row.to_dict()
-    except Exception:
-        # Fallback: 0 prices
-        latest_prices = {}
 
     prices = []
     values = []
+
     for _, row in df.iterrows():
         ticker = str(row["Ticker"]).strip()
         shares = float(row.get("Shares", 0.0) or 0.0)
-        price = float(latest_prices.get(ticker, 0.0))
+
+        price = 0.0
+        if ticker:
+            try:
+                t = yf.Ticker(ticker)
+                hist = t.history(period="1d")
+                # show a tiny debug line for each ticker
+                st.write(f"Debug {ticker}: history rows = {len(hist)}")
+                if not hist.empty:
+                    price = float(hist["Close"].iloc[-1])
+            except Exception as e:
+                st.warning(f"Could not fetch price for {ticker}: {e}")
+
         value = price * shares
         prices.append(price)
         values.append(value)
@@ -337,7 +330,6 @@ def fetch_prices_for_portfolio(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["Weight"] = 0.0
 
-    # Ensure Class column exists and is valid
     if "Class" not in df.columns:
         df["Class"] = "Stocks"
     df["Class"] = df["Class"].where(df["Class"].isin(ASSET_CLASSES), "Stocks")
