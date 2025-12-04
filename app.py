@@ -30,7 +30,7 @@ if "portfolio_df" not in st.session_state:
     st.session_state["portfolio_df"] = pd.DataFrame(
         [
             {"Ticker": "VWCE.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
-            {"Ticker": "MWRD.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
+            {"Ticker": "AGGH.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
         ]
     )
 
@@ -443,6 +443,21 @@ def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataF
         "Date": portfolio_series.index,
         "PortfolioValue": portfolio_series.values
     }).set_index("Date")
+
+    # 🔧 Remove unrealistic one-day jumps created by Yahoo glitches
+    # Compute daily returns
+    hist["Return"] = hist["PortfolioValue"].pct_change()
+
+    # Identify outliers (you can adjust threshold)
+    outliers = hist["Return"].abs() > 0.08   # > 8% daily move = bad data
+
+    # Forward-fill only the bad values
+    hist.loc[outliers, "PortfolioValue"] = np.nan
+    hist["PortfolioValue"] = hist["PortfolioValue"].ffill()
+
+    # Drop the temporary column
+    hist = hist.drop(columns=["Return"])
+	
 
     return hist
 
@@ -1055,7 +1070,7 @@ def main():
             )
         else:
             st.markdown(
-                "❌ In the **base scenario**, you do **not** reach FI before your chosen retirement age. "
+                "❌ In the **base scenario**, you do **not** reach FI before your chosen retirement age. "<f
                 "Try increasing monthly investing, bonuses, or expected return, or lowering target spending."
             )
 
@@ -1113,4 +1128,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
