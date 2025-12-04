@@ -7,13 +7,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+
+# Conditional import so it works locally & on Streamlit Cloud
 try:
     from streamlit_js_eval import streamlit_js_eval
 except ModuleNotFoundError:
-    # Fallback stub for local development
+    # Fallback stub for local development (no browser localStorage)
     def streamlit_js_eval(*args, **kwargs):
         return None
-
 
 
 # ---------- Session State Setup ----------
@@ -24,7 +25,7 @@ if "scenarios" not in st.session_state:
 if "active_scenario" not in st.session_state:
     st.session_state["active_scenario"] = None
 
-# Default portfolio table (only used if nothing is in localStorage)
+# Default portfolio table (used if nothing loaded from localStorage)
 if "portfolio_df" not in st.session_state:
     st.session_state["portfolio_df"] = pd.DataFrame(
         [
@@ -352,7 +353,70 @@ def allocation_from_portfolio(df: pd.DataFrame) -> dict:
     }
 
 
-# ---------- LocalStorage Helpers (Option B) ----------
+# ---------- Portfolio History (daily performance) ----------
+
+def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataFrame:
+    """
+    Build a daily history of total portfolio value over a given period
+    based on the CURRENT tickers + shares in the table.
+
+    period examples: '3mo', '6mo', '1y', '2y'
+    """
+    df = df.copy()
+
+    # Only tickers with positive shares
+    if "Shares" not in df.columns or "Ticker" not in df.columns:
+        return pd.DataFrame()
+
+    df = df[df["Shares"].astype(float) > 0]
+    if df.empty:
+        return pd.DataFrame()
+
+    tickers = df["Ticker"].astype(str).str.strip().tolist()
+    shares_map = dict(zip(df["Ticker"].astype(str).str.strip(), df["Shares"].astype(float)))
+
+    try:
+        price_data = yf.download(
+            tickers,
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception as e:
+        st.error(f"Could not download history for portfolio: {e}")
+        return pd.DataFrame()
+
+    # Handle single vs multiple tickers structure
+    if isinstance(price_data, pd.DataFrame) and "Adj Close" in price_data.columns:
+        close = price_data["Adj Close"]
+    else:
+        close = price_data
+
+    # If single ticker, make it a DataFrame
+    if isinstance(close, pd.Series):
+        close = close.to_frame(name=tickers[0])
+
+    # Align columns with tickers present in shares_map
+    cols = [c for c in close.columns if c in shares_map]
+    if not cols:
+        return pd.DataFrame()
+
+    close = close[cols]
+
+    # Multiply each ticker's price by its shares
+    for ticker in cols:
+        close[ticker] = close[ticker] * shares_map[ticker]
+
+    # Sum across tickers -> total portfolio value per day
+    portfolio_series = close.sum(axis=1)
+    hist_df = pd.DataFrame({"Date": portfolio_series.index, "PortfolioValue": portfolio_series.values})
+    hist_df.set_index("Date", inplace=True)
+
+    return hist_df
+
+
+# ---------- LocalStorage Helpers (browser persistence) ----------
 
 def load_portfolio_from_localstorage():
     """
@@ -377,16 +441,13 @@ def save_portfolio_to_localstorage(df: pd.DataFrame):
     """
     Saves the current portfolio dataframe to browser localStorage
     as a JSON string.
-
-    Fix: use a UNIQUE key for every call so Streamlit doesn't complain.
     """
     try:
         json_str = df.to_json()
         js_code = f"window.localStorage.setItem('{LOCALSTORAGE_KEY}', {json.dumps(json_str)});"
 
-        # unique key to avoid duplication conflicts
+        # Use unique key each time to avoid Streamlit duplicate-key errors
         unique_key = f"save_portfolio_{np.random.randint(0, 1_000_000)}"
-
         streamlit_js_eval(js_expressions=js_code, key=unique_key)
 
     except Exception as e:
@@ -399,12 +460,11 @@ def main():
     st.set_page_config(page_title="FI & Portfolio Projection", layout="wide")
     st.title("📈 Financial Independence & Portfolio Projection Tool")
 
-    # Always *attempt* to load from localStorage; if nothing stored, this does nothing.
+    # Try to load portfolio from browser storage on each run (no harm if empty)
     try:
         load_portfolio_from_localstorage()
     except Exception as e:
         st.warning(f"Could not load portfolio from local storage: {e}")
-
 
     st.markdown(
         """
@@ -452,12 +512,11 @@ def main():
 
     portfolio_df = st.session_state["portfolio_df"]
 
-    # If Price/Value not present (first load), set them to zero
-    if "Price" not in portfolio_df.columns or "Value" not in portfolio_df.columns:
-        portfolio_df["Price"] = 0.0
-        portfolio_df["Value"] = 0.0
-        portfolio_df["Weight"] = 0.0
-        st.session_state["portfolio_df"] = portfolio_df
+    # Ensure Price/Value/Weight columns exist
+    for col in ["Price", "Value", "Weight"]:
+        if col not in portfolio_df.columns:
+            portfolio_df[col] = 0.0
+    st.session_state["portfolio_df"] = portfolio_df
 
     total_portfolio_value = portfolio_df["Value"].sum()
     st.markdown(f"**Total portfolio value (from table):** €{total_portfolio_value:,.2f}")
@@ -469,6 +528,29 @@ def main():
             ),
             use_container_width=True,
         )
+
+    # --- NEW: Historical performance chart ---
+    with st.expander("📈 Historical performance of this portfolio (based on past prices)", expanded=False):
+        period = st.selectbox(
+            "Period",
+            options=["3mo", "6mo", "1y", "2y"],
+            index=1,  # default 6mo
+            key="hist_period",
+        )
+
+        if st.button("Build history from prices", key="build_history"):
+            hist_df = compute_portfolio_history(portfolio_df, period=period)
+            if hist_df.empty:
+                st.warning("No historical data could be built for this portfolio (check tickers).")
+            else:
+                st.line_chart(hist_df["PortfolioValue"])
+                start_val = hist_df["PortfolioValue"].iloc[0]
+                end_val = hist_df["PortfolioValue"].iloc[-1]
+                change_pct = (end_val / start_val - 1) * 100 if start_val > 0 else 0.0
+                st.markdown(
+                    f"Start: **€{start_val:,.0f}** → End: **€{end_val:,.0f}** "
+                    f"({change_pct:+.1f}%) over **{period}**."
+                )
 
     # Derive allocation from portfolio (for use-my-portfolio mode)
     portfolio_alloc = allocation_from_portfolio(portfolio_df)
@@ -665,6 +747,7 @@ def main():
         key="volatility_pct",
     )
 
+    # Decide whether to use allocation-derived or manual return/vol
     use_allocation = (alloc_source == "Use my portfolio")
 
     if use_allocation:
@@ -980,7 +1063,7 @@ def main():
         st.metric("Probability of Reaching FI by Retirement", f"{prob_fi:.1f}%")
 
     st.markdown("---")
-    st.caption("Built for Klaas' FI obsession 🧮. Portfolio is now remembered in your browser.")
+    st.caption("Built for Klaas' FI obsession 🧮. Portfolio is remembered in your browser, performance charted from real prices.")
 
 
 if __name__ == "__main__":
