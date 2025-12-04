@@ -30,7 +30,7 @@ if "portfolio_df" not in st.session_state:
     st.session_state["portfolio_df"] = pd.DataFrame(
         [
             {"Ticker": "VWCE.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
-            {"Ticker": "MWRD.PA", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
+            {"Ticker": "AGGH.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
         ]
     )
 
@@ -426,6 +426,11 @@ def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataF
         return pd.DataFrame()
 
     close = close[valid_cols]
+
+    # 🔧 Fix: fill missing prices forward so gaps don't create fake crashes
+    close = close.ffill().dropna(how="all")
+
+  
 
     # Multiply prices × shares
     for t in valid_cols:
@@ -1108,5 +1113,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
