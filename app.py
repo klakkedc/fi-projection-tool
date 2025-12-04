@@ -28,8 +28,8 @@ if "active_scenario" not in st.session_state:
 if "portfolio_df" not in st.session_state:
     st.session_state["portfolio_df"] = pd.DataFrame(
         [
-            {"Ticker": "MWRD.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
-            {"Ticker": "VGWD.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
+            {"Ticker": "VWCE.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
+            {"Ticker": "AGGH.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
         ]
     )
 
@@ -399,13 +399,12 @@ def main():
     st.set_page_config(page_title="FI & Portfolio Projection", layout="wide")
     st.title("📈 Financial Independence & Portfolio Projection Tool")
 
-    # Load portfolio from browser storage on first run in this session
-    if "portfolio_loaded_from_storage" not in st.session_state:
-        st.session_state["portfolio_loaded_from_storage"] = True
-        try:
-            load_portfolio_from_localstorage()
-        except Exception as e:
-            st.warning(f"Could not load portfolio from local storage: {e}")
+    # Always *attempt* to load from localStorage; if nothing stored, this does nothing.
+    try:
+        load_portfolio_from_localstorage()
+    except Exception as e:
+        st.warning(f"Could not load portfolio from local storage: {e}")
+
 
     st.markdown(
         """
@@ -986,4 +985,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
