@@ -5,6 +5,7 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 
 
 # ---------- Session State Setup ----------
@@ -14,6 +15,15 @@ if "scenarios" not in st.session_state:
 
 if "active_scenario" not in st.session_state:
     st.session_state["active_scenario"] = None
+
+# portfolio state
+if "portfolio_df" not in st.session_state:
+    st.session_state["portfolio_df"] = pd.DataFrame(
+        [
+            {"Ticker": "VWCE.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
+            {"Ticker": "AGGH.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
+        ]
+    )
 
 
 # ---------- Data Models ----------
@@ -233,7 +243,6 @@ def compute_portfolio_from_allocation(weights_pct: dict):
     Returns (expected_return, volatility)
     """
 
-    # Convert to array and normalize
     labels = ["stocks", "bonds", "reit", "gold", "cash"]
     w = np.array([weights_pct.get(k, 0.0) for k in labels], dtype=float)
     total = w.sum()
@@ -242,8 +251,7 @@ def compute_portfolio_from_allocation(weights_pct: dict):
         return 0.0, 0.0
     w = w / total
 
-    # Reasonable long-term assumptions (real-ish, but simple)
-    # Annual expected returns
+    # Reasonable long-term assumptions
     mu = np.array([
         0.07,  # stocks
         0.02,  # bonds
@@ -252,7 +260,6 @@ def compute_portfolio_from_allocation(weights_pct: dict):
         0.01,  # cash
     ])
 
-    # Annual volatilities
     sigma = np.array([
         0.18,  # stocks
         0.06,  # bonds
@@ -261,7 +268,7 @@ def compute_portfolio_from_allocation(weights_pct: dict):
         0.01,  # cash
     ])
 
-    # Correlation matrix (roughly realistic structure)
+    # Correlation matrix (rough structure)
     corr = np.array([
         [1.00,  0.10, 0.70, 0.20, 0.00],
         [0.10,  1.00, 0.20, 0.00, 0.10],
@@ -279,6 +286,87 @@ def compute_portfolio_from_allocation(weights_pct: dict):
     return expected_return, volatility
 
 
+# ---------- Portfolio Helpers ----------
+
+ASSET_CLASSES = ["Stocks", "Bonds", "REIT", "Gold", "Cash"]
+
+
+def fetch_prices_for_portfolio(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Takes a DataFrame with columns ['Ticker','Shares', 'Class'] and
+    returns a new DataFrame with Price, Value, and Weight.
+    """
+    df = df.copy()
+    tickers = df["Ticker"].astype(str).str.strip()
+    tickers_nonempty = tickers[tickers != ""].tolist()
+
+    if not tickers_nonempty:
+        df["Price"] = 0.0
+        df["Value"] = 0.0
+        df["Weight"] = 0.0
+        return df
+
+    try:
+        price_data = yf.download(tickers_nonempty, period="1d", progress=False)["Adj Close"]
+        # If only one ticker, price_data is a Series
+        if isinstance(price_data, pd.Series):
+            latest_prices = price_data.iloc[-1:].to_dict()
+        else:
+            latest_row = price_data.iloc[-1]
+            latest_prices = latest_row.to_dict()
+    except Exception:
+        # Fallback: 0 prices
+        latest_prices = {}
+
+    prices = []
+    values = []
+    for _, row in df.iterrows():
+        ticker = str(row["Ticker"]).strip()
+        shares = float(row.get("Shares", 0.0) or 0.0)
+        price = float(latest_prices.get(ticker, 0.0))
+        value = price * shares
+        prices.append(price)
+        values.append(value)
+
+    df["Price"] = prices
+    df["Value"] = values
+
+    total_value = df["Value"].sum()
+    if total_value > 0:
+        df["Weight"] = df["Value"] / total_value
+    else:
+        df["Weight"] = 0.0
+
+    # Ensure Class column exists and is valid
+    if "Class" not in df.columns:
+        df["Class"] = "Stocks"
+    df["Class"] = df["Class"].where(df["Class"].isin(ASSET_CLASSES), "Stocks")
+
+    return df
+
+
+def allocation_from_portfolio(df: pd.DataFrame) -> dict:
+    """
+    Aggregate portfolio by asset class -> % weights dict.
+    Returns dict with keys 'stocks','bonds','reit','gold','cash'.
+    """
+    if df.empty or df["Value"].sum() <= 0:
+        return {"stocks": 0, "bonds": 0, "reit": 0, "gold": 0, "cash": 0}
+
+    # Group by Class
+    grp = df.groupby("Class")["Value"].sum()
+    total = grp.sum()
+    weights = grp / total
+
+    return {
+        "stocks": float(weights.get("Stocks", 0.0) * 100),
+        "bonds": float(weights.get("Bonds", 0.0) * 100),
+        "reit": float(weights.get("REIT", 0.0) * 100),
+        "gold": float(weights.get("Gold", 0.0) * 100),
+        "cash": float(weights.get("Cash", 0.0) * 100),
+    }
+
+
 # ---------- Streamlit UI ----------
 
 def main():
@@ -289,15 +377,57 @@ def main():
         """
         This tool projects your portfolio year by year, calculates your **FI number**,  
         estimates your **FI age**, **Coast FI age**, and runs a **Monte Carlo simulation**  
-        including an optional **historical crash scenario** and an **asset allocation engine**.
+        including an optional **historical crash scenario** and an **asset allocation engine**  
+        that can derive returns from your **real portfolio holdings**.
         """
     )
+
+    # --- Portfolio section (main page, top) ---
+
+    st.subheader("📥 Your Current Portfolio (Tickers + Shares)")
+
+    st.markdown(
+        "Enter your tickers and number of shares. "
+        "Click **Fetch live prices** to update values. "
+        "Choose the asset class per row to feed the allocation engine."
+    )
+
+    with st.expander("Edit portfolio holdings", expanded=True):
+        edited_df = st.data_editor(
+            st.session_state["portfolio_df"],
+            num_rows="dynamic",
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "Shares": st.column_config.NumberColumn("Shares", step=1.0),
+                "Class": st.column_config.SelectboxColumn("Class", options=ASSET_CLASSES),
+            },
+            use_container_width=True,
+        )
+        st.session_state["portfolio_df"] = edited_df
+
+        if st.button("🔄 Fetch live prices"):
+            st.session_state["portfolio_df"] = fetch_prices_for_portfolio(st.session_state["portfolio_df"])
+
+    portfolio_df = st.session_state["portfolio_df"]
+    if "Price" not in portfolio_df.columns or "Value" not in portfolio_df.columns:
+        portfolio_df = fetch_prices_for_portfolio(portfolio_df)
+        st.session_state["portfolio_df"] = portfolio_df
+
+    total_portfolio_value = portfolio_df["Value"].sum()
+    st.markdown(f"**Total portfolio value (live):** €{total_portfolio_value:,.2f}")
+
+    if total_portfolio_value > 0:
+        st.dataframe(
+            portfolio_df.style.format({"Price": "€{:,.2f}", "Value": "€{:,.2f}", "Weight": "{:.2%}"}),
+            use_container_width=True,
+        )
+
+    # Derive allocation from portfolio
+    portfolio_alloc = allocation_from_portfolio(portfolio_df)
 
     # --- Inputs ---
 
     st.sidebar.header("🔧 Basic Inputs")
-
-    # All inputs with keys so they can be saved/loaded
 
     col1, col2 = st.sidebar.columns(2)
     current_age = col1.number_input(
@@ -313,7 +443,8 @@ def main():
     )
 
     current_portfolio = st.sidebar.number_input(
-        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=10000.00, key="current_portfolio"
+        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=float(total_portfolio_value or 44327.73),
+        key="current_portfolio"
     )
 
     monthly_invest = st.sidebar.number_input(
@@ -369,16 +500,33 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("📊 Asset Allocation Engine")
 
-    use_allocation = st.sidebar.checkbox(
-        "Use asset allocation to set return & volatility", value=True, key="use_allocation"
+    alloc_source = st.sidebar.radio(
+        "Allocation source",
+        options=["Use manual sliders", "Use my portfolio"],
+        index=1 if total_portfolio_value > 0 else 0,
+        key="alloc_source",
     )
 
-    # allocation sliders (in %)
-    aa_stocks = st.sidebar.slider("Stocks (%)", 0, 100, 80, step=5, key="aa_stocks")
-    aa_bonds = st.sidebar.slider("Bonds (%)", 0, 100, 10, step=5, key="aa_bonds")
-    aa_reit = st.sidebar.slider("REITs (%)", 0, 100, 5, step=5, key="aa_reit")
-    aa_gold = st.sidebar.slider("Gold (%)", 0, 100, 5, step=5, key="aa_gold")
-    aa_cash = st.sidebar.slider("Cash (%)", 0, 100, 0, step=5, key="aa_cash")
+    if alloc_source == "Use manual sliders":
+        aa_stocks = st.sidebar.slider("Stocks (%)", 0, 100, 80, step=5, key="aa_stocks")
+        aa_bonds = st.sidebar.slider("Bonds (%)", 0, 100, 10, step=5, key="aa_bonds")
+        aa_reit = st.sidebar.slider("REITs (%)", 0, 100, 5, step=5, key="aa_reit")
+        aa_gold = st.sidebar.slider("Gold (%)", 0, 100, 5, step=5, key="aa_gold")
+        aa_cash = st.sidebar.slider("Cash (%)", 0, 100, 0, step=5, key="aa_cash")
+    else:
+        # Use portfolio-derived allocation (display but not sliders)
+        aa_stocks = int(round(portfolio_alloc["stocks"]))
+        aa_bonds = int(round(portfolio_alloc["bonds"]))
+        aa_reit = int(round(portfolio_alloc["reit"]))
+        aa_gold = int(round(portfolio_alloc["gold"]))
+        aa_cash = int(round(portfolio_alloc["cash"]))
+
+        st.sidebar.write("Derived from your portfolio:")
+        st.sidebar.write(f"- Stocks: **{aa_stocks}%**")
+        st.sidebar.write(f"- Bonds: **{aa_bonds}%**")
+        st.sidebar.write(f"- REIT: **{aa_reit}%**")
+        st.sidebar.write(f"- Gold: **{aa_gold}%**")
+        st.sidebar.write(f"- Cash: **{aa_cash}%**")
 
     alloc_total = aa_stocks + aa_bonds + aa_reit + aa_gold + aa_cash
     st.sidebar.caption(f"Total allocation: **{alloc_total}%** (normalized internally).")
@@ -393,19 +541,6 @@ def main():
 
     alloc_return, alloc_vol = compute_portfolio_from_allocation(alloc_dict)
 
-    if use_allocation:
-        annual_return = alloc_return
-        annual_return_pct_display = annual_return * 100
-    else:
-        annual_return = annual_return_pct_manual / 100.0
-        annual_return_pct_display = annual_return_pct_manual
-
-    st.sidebar.metric(
-        "Effective Annual Return (%)",
-        f"{annual_return_pct_display:.2f}",
-        help="Either from asset allocation or manual input.",
-    )
-
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧨 Historical Crash Scenario")
 
@@ -413,7 +548,6 @@ def main():
     crash_year_offset = None
     crash_drawdown = 0.0
     if simulate_crash:
-        # 1 = first projected year (end of this year)
         max_year_offset = max(1, st.session_state.retirement_age - st.session_state.current_age)
         crash_year_offset = st.sidebar.number_input(
             "Crash year offset (1 = first projected year)",
@@ -476,17 +610,27 @@ def main():
         key="volatility_pct",
     )
 
+    # Decide whether to use allocation-derived or manual return/vol
+    use_allocation = (alloc_source == "Use my portfolio")
+
     if use_allocation:
+        annual_return = alloc_return
+        annual_return_pct_display = annual_return * 100
         annual_volatility = alloc_vol
         volatility_pct_display = annual_volatility * 100
     else:
+        annual_return = annual_return_pct_manual / 100.0
+        annual_return_pct_display = annual_return_pct_manual
         annual_volatility = volatility_pct_manual / 100.0
         volatility_pct_display = volatility_pct_manual
 
     st.sidebar.metric(
+        "Effective Annual Return (%)",
+        f"{annual_return_pct_display:.2f}",
+    )
+    st.sidebar.metric(
         "Effective Volatility (%)",
         f"{volatility_pct_display:.2f}",
-        help="Either from asset allocation or manual input.",
     )
 
     # --- Save/Load Scenarios ---
@@ -529,12 +673,12 @@ def main():
                 "simulate_crash": st.session_state.simulate_crash,
                 "crash_year_offset": st.session_state.get("crash_year_offset"),
                 "crash_drawdown_pct": st.session_state.get("crash_drawdown_pct", 37.0),
-                "use_allocation": st.session_state.use_allocation,
-                "aa_stocks": st.session_state.aa_stocks,
-                "aa_bonds": st.session_state.aa_bonds,
-                "aa_reit": st.session_state.aa_reit,
-                "aa_gold": st.session_state.aa_gold,
-                "aa_cash": st.session_state.aa_cash,
+                "alloc_source": st.session_state.alloc_source,
+                "aa_stocks": aa_stocks,
+                "aa_bonds": aa_bonds,
+                "aa_reit": aa_reit,
+                "aa_gold": aa_gold,
+                "aa_cash": aa_cash,
             }
             st.session_state["active_scenario"] = scenario_name.strip()
             st.sidebar.success(f"Saved scenario '{scenario_name.strip()}'")
@@ -571,24 +715,16 @@ def main():
     early_retirement_age = st.session_state.early_ret_age
     mc_runs = int(st.session_state.mc_runs)
     simulate_crash = st.session_state.simulate_crash
-    use_allocation = st.session_state.use_allocation
+    alloc_source = st.session_state.alloc_source
 
-    # recompute allocation-based return & vol (in case loaded)
-    alloc_dict_loaded = {
-        "stocks": st.session_state.aa_stocks,
-        "bonds": st.session_state.aa_bonds,
-        "reit": st.session_state.aa_reit,
-        "gold": st.session_state.aa_gold,
-        "cash": st.session_state.aa_cash,
+    # Rebuild allocation dict from either manual or portfolio-derived (already set above)
+    alloc_dict_final = {
+        "stocks": aa_stocks,
+        "bonds": aa_bonds,
+        "reit": aa_reit,
+        "gold": aa_gold,
+        "cash": aa_cash,
     }
-    alloc_return_loaded, alloc_vol_loaded = compute_portfolio_from_allocation(alloc_dict_loaded)
-
-    if use_allocation:
-        annual_return = alloc_return_loaded
-        annual_volatility = alloc_vol_loaded
-    else:
-        annual_return = st.session_state.annual_return_pct / 100.0
-        annual_volatility = st.session_state.volatility_pct / 100.0
 
     crash_year_offset = st.session_state.get("crash_year_offset") if simulate_crash else None
     crash_drawdown = (st.session_state.get("crash_drawdown_pct", 37.0) / 100.0) if simulate_crash else 0.0
@@ -800,9 +936,8 @@ def main():
         st.metric("Probability of Reaching FI by Retirement", f"{prob_fi:.1f}%")
 
     st.markdown("---")
-    st.caption("Built for Klaas' FI obsession 🧮. Alex is Gay.")
+    st.caption("Built for Klaas' FI obsession 🧮. Now reading your real holdings live.")
 
 
 if __name__ == "__main__":
     main()
-
