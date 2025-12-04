@@ -7,7 +7,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-from streamlit_js_eval import streamlit_js_eval
+try:
+    from streamlit_js_eval import streamlit_js_eval
+except ModuleNotFoundError:
+    # Fallback stub for local development
+    def streamlit_js_eval(*args, **kwargs):
+        return None
+
 
 
 # ---------- Session State Setup ----------
@@ -370,12 +376,19 @@ def load_portfolio_from_localstorage():
 def save_portfolio_to_localstorage(df: pd.DataFrame):
     """
     Saves the current portfolio dataframe to browser localStorage
-    as JSON string.
+    as a JSON string.
+
+    Fix: use a UNIQUE key for every call so Streamlit doesn't complain.
     """
     try:
         json_str = df.to_json()
         js_code = f"window.localStorage.setItem('{LOCALSTORAGE_KEY}', {json.dumps(json_str)});"
-        streamlit_js_eval(js_expressions=js_code, key="save_portfolio")
+
+        # unique key to avoid duplication conflicts
+        unique_key = f"save_portfolio_{np.random.randint(0, 1_000_000)}"
+
+        streamlit_js_eval(js_expressions=js_code, key=unique_key)
+
     except Exception as e:
         st.warning(f"Could not save portfolio to localStorage: {e}")
 
