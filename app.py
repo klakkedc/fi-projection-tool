@@ -1,4 +1,5 @@
 import math
+import json
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -6,6 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+from streamlit_js_eval import streamlit_js_eval
 
 
 # ---------- Session State Setup ----------
@@ -16,12 +18,12 @@ if "scenarios" not in st.session_state:
 if "active_scenario" not in st.session_state:
     st.session_state["active_scenario"] = None
 
-# portfolio state
+# Default portfolio table (only used if nothing is in localStorage)
 if "portfolio_df" not in st.session_state:
     st.session_state["portfolio_df"] = pd.DataFrame(
         [
-            {"Ticker": "MWRD.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
-            {"Ticker": "VGWD.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
+            {"Ticker": "VWCE.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
+            {"Ticker": "AGGH.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
         ]
     )
 
@@ -92,7 +94,6 @@ def run_projection(params: ProjectionInput) -> ProjectionResult:
     fi_number_today = annual_spend_today / params.safe_withdrawal_rate
 
     for year_idx in range(1, num_years + 1):
-        # Allow per-year override of return (for crash, etc.)
         annual_rate_this_year = params.annual_return
         monthly_rate = (1 + annual_rate_this_year) ** (1 / 12) - 1
 
@@ -139,7 +140,6 @@ def run_projection(params: ProjectionInput) -> ProjectionResult:
     coast_fi_age: Optional[int] = None
     annual_rate = params.annual_return
     num_years_total = num_years
-    # FI number at retirement in nominal terms
     fi_number_at_retirement = fi_number_today * ((1 + params.inflation_rate) ** num_years_total)
 
     for yr in years:
@@ -177,16 +177,6 @@ def monte_carlo_simulation(
     """
     Monte Carlo simulation of future portfolio values.
     annual_return and annual_volatility are decimals (0.065, 0.15).
-    crash_year_offset is 1-based index of the projected year where a crash happens
-    with drawdown 'crash_drawdown' (0.37 = -37%).
-    Returns:
-        {
-            "ages": [age1, age2, ...],
-            "median": np.array,
-            "p10": np.array,
-            "p90": np.array,
-            "all_paths": np.array shape (runs, years)
-        }
     """
     years = retirement_age - current_age
     ages = [current_age + i for i in range(1, years + 1)]
@@ -242,12 +232,10 @@ def compute_portfolio_from_allocation(weights_pct: dict):
     weights_pct: dict with keys 'stocks','bonds','reit','gold','cash' in %
     Returns (expected_return, volatility)
     """
-
     labels = ["stocks", "bonds", "reit", "gold", "cash"]
     w = np.array([weights_pct.get(k, 0.0) for k in labels], dtype=float)
     total = w.sum()
     if total <= 0:
-        # fallback: all cash, 0 return, 0 vol
         return 0.0, 0.0
     w = w / total
 
@@ -268,7 +256,6 @@ def compute_portfolio_from_allocation(weights_pct: dict):
         0.01,  # cash
     ])
 
-    # Correlation matrix (rough structure)
     corr = np.array([
         [1.00,  0.10, 0.70, 0.20, 0.00],
         [0.10,  1.00, 0.20, 0.00, 0.10],
@@ -289,12 +276,13 @@ def compute_portfolio_from_allocation(weights_pct: dict):
 # ---------- Portfolio Helpers ----------
 
 ASSET_CLASSES = ["Stocks", "Bonds", "REIT", "Gold", "Cash"]
+LOCALSTORAGE_KEY = "fi_portfolio_v1"
 
 
 def fetch_prices_for_portfolio(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Very simple price fetch: 1d history per ticker, no caching.
-    Shows warnings in the app if something fails.
+    Simple price fetch: 1d history per ticker.
+    Shows warnings if something fails but keeps app usable.
     """
     df = df.copy()
 
@@ -306,16 +294,17 @@ def fetch_prices_for_portfolio(df: pd.DataFrame) -> pd.DataFrame:
         shares = float(row.get("Shares", 0.0) or 0.0)
 
         price = 0.0
+
         if ticker:
             try:
                 t = yf.Ticker(ticker)
                 hist = t.history(period="1d")
-                # show a tiny debug line for each ticker
-                st.write(f"Debug {ticker}: history rows = {len(hist)}")
                 if not hist.empty:
                     price = float(hist["Close"].iloc[-1])
+                else:
+                    st.warning(f"⚠️ No price data returned for {ticker}.")
             except Exception as e:
-                st.warning(f"Could not fetch price for {ticker}: {e}")
+                st.warning(f"⚠️ Could not fetch price for {ticker}: {e}")
 
         value = price * shares
         prices.append(price)
@@ -340,12 +329,10 @@ def fetch_prices_for_portfolio(df: pd.DataFrame) -> pd.DataFrame:
 def allocation_from_portfolio(df: pd.DataFrame) -> dict:
     """
     Aggregate portfolio by asset class -> % weights dict.
-    Returns dict with keys 'stocks','bonds','reit','gold','cash'.
     """
     if df.empty or df["Value"].sum() <= 0:
         return {"stocks": 0, "bonds": 0, "reit": 0, "gold": 0, "cash": 0}
 
-    # Group by Class
     grp = df.groupby("Class")["Value"].sum()
     total = grp.sum()
     weights = grp / total
@@ -359,11 +346,53 @@ def allocation_from_portfolio(df: pd.DataFrame) -> dict:
     }
 
 
+# ---------- LocalStorage Helpers (Option B) ----------
+
+def load_portfolio_from_localstorage():
+    """
+    Reads portfolio JSON from browser localStorage (if present)
+    and loads it into st.session_state["portfolio_df"].
+    """
+    stored = streamlit_js_eval(
+        js_expressions="window.localStorage.getItem('" + LOCALSTORAGE_KEY + "')",
+        key="load_portfolio",
+        want_output=True,
+    )
+    if stored:
+        try:
+            df = pd.read_json(stored)
+            if not df.empty:
+                st.session_state["portfolio_df"] = df
+        except Exception as e:
+            st.warning(f"Could not decode stored portfolio from localStorage: {e}")
+
+
+def save_portfolio_to_localstorage(df: pd.DataFrame):
+    """
+    Saves the current portfolio dataframe to browser localStorage
+    as JSON string.
+    """
+    try:
+        json_str = df.to_json()
+        js_code = f"window.localStorage.setItem('{LOCALSTORAGE_KEY}', {json.dumps(json_str)});"
+        streamlit_js_eval(js_expressions=js_code, key="save_portfolio")
+    except Exception as e:
+        st.warning(f"Could not save portfolio to localStorage: {e}")
+
+
 # ---------- Streamlit UI ----------
 
 def main():
     st.set_page_config(page_title="FI & Portfolio Projection", layout="wide")
     st.title("📈 Financial Independence & Portfolio Projection Tool")
+
+    # Load portfolio from browser storage on first run in this session
+    if "portfolio_loaded_from_storage" not in st.session_state:
+        st.session_state["portfolio_loaded_from_storage"] = True
+        try:
+            load_portfolio_from_localstorage()
+        except Exception as e:
+            st.warning(f"Could not load portfolio from local storage: {e}")
 
     st.markdown(
         """
@@ -374,14 +403,15 @@ def main():
         """
     )
 
-    # --- Portfolio section (main page, top) ---
+    # --- Portfolio section (top) ---
 
     st.subheader("📥 Your Current Portfolio (Tickers + Shares)")
 
     st.markdown(
         "Enter your tickers and number of shares. "
         "Click **Fetch live prices** to update values. "
-        "Choose the asset class per row to feed the allocation engine."
+        "Choose the asset class per row to feed the allocation engine.\n\n"
+        "_Your portfolio is automatically saved in this browser and will be restored next time._"
     )
 
     with st.expander("Edit portfolio holdings", expanded=True):
@@ -390,34 +420,48 @@ def main():
             num_rows="dynamic",
             column_config={
                 "Ticker": st.column_config.TextColumn("Ticker"),
-                "Shares": st.column_config.NumberColumn("Shares", step=0.01),
+                "Shares": st.column_config.NumberColumn(
+                    "Shares",
+                    step=0.01,
+                    format="%.4f",
+                ),
                 "Class": st.column_config.SelectboxColumn("Class", options=ASSET_CLASSES),
             },
             use_container_width=True,
         )
+
+        # Update session state and save to browser storage
         st.session_state["portfolio_df"] = edited_df
+        save_portfolio_to_localstorage(st.session_state["portfolio_df"])
 
         if st.button("🔄 Fetch live prices"):
             st.session_state["portfolio_df"] = fetch_prices_for_portfolio(st.session_state["portfolio_df"])
+            save_portfolio_to_localstorage(st.session_state["portfolio_df"])
 
     portfolio_df = st.session_state["portfolio_df"]
+
+    # If Price/Value not present (first load), set them to zero
     if "Price" not in portfolio_df.columns or "Value" not in portfolio_df.columns:
-        portfolio_df = fetch_prices_for_portfolio(portfolio_df)
+        portfolio_df["Price"] = 0.0
+        portfolio_df["Value"] = 0.0
+        portfolio_df["Weight"] = 0.0
         st.session_state["portfolio_df"] = portfolio_df
 
     total_portfolio_value = portfolio_df["Value"].sum()
-    st.markdown(f"**Total portfolio value (live):** €{total_portfolio_value:,.2f}")
+    st.markdown(f"**Total portfolio value (from table):** €{total_portfolio_value:,.2f}")
 
-    if total_portfolio_value > 0:
+    if len(portfolio_df) > 0:
         st.dataframe(
-            portfolio_df.style.format({"Price": "€{:,.2f}", "Value": "€{:,.2f}", "Weight": "{:.2%}"}),
+            portfolio_df.style.format(
+                {"Price": "€{:,.2f}", "Value": "€{:,.2f}", "Weight": "{:.2%}"}
+            ),
             use_container_width=True,
         )
 
-    # Derive allocation from portfolio
+    # Derive allocation from portfolio (for use-my-portfolio mode)
     portfolio_alloc = allocation_from_portfolio(portfolio_df)
 
-    # --- Inputs ---
+    # --- Sidebar Inputs ---
 
     st.sidebar.header("🔧 Basic Inputs")
 
@@ -434,9 +478,12 @@ def main():
         key="retirement_age",
     )
 
-    current_portfolio = st.sidebar.number_input(
-        "Current Portfolio (€)", min_value=0.0, step=1000.0, value=float(total_portfolio_value or 44327.73),
-        key="current_portfolio"
+    current_portfolio_input = st.sidebar.number_input(
+        "Current Portfolio for Projection (€)",
+        min_value=0.0,
+        step=1000.0,
+        value=float(total_portfolio_value or 44327.73),
+        key="current_portfolio",
     )
 
     monthly_invest = st.sidebar.number_input(
@@ -506,7 +553,6 @@ def main():
         aa_gold = st.sidebar.slider("Gold (%)", 0, 100, 5, step=5, key="aa_gold")
         aa_cash = st.sidebar.slider("Cash (%)", 0, 100, 0, step=5, key="aa_cash")
     else:
-        # Use portfolio-derived allocation (display but not sliders)
         aa_stocks = int(round(portfolio_alloc["stocks"]))
         aa_bonds = int(round(portfolio_alloc["bonds"]))
         aa_reit = int(round(portfolio_alloc["reit"]))
@@ -550,7 +596,12 @@ def main():
             key="crash_year_offset",
         )
         crash_drawdown_pct = st.sidebar.number_input(
-            "Crash drawdown (%)", min_value=5.0, max_value=90.0, value=37.0, step=1.0, key="crash_drawdown_pct"
+            "Crash drawdown (%)",
+            min_value=5.0,
+            max_value=90.0,
+            value=37.0,
+            step=1.0,
+            key="crash_drawdown_pct",
         )
         crash_drawdown = crash_drawdown_pct / 100.0
 
@@ -602,7 +653,6 @@ def main():
         key="volatility_pct",
     )
 
-    # Decide whether to use allocation-derived or manual return/vol
     use_allocation = (alloc_source == "Use my portfolio")
 
     if use_allocation:
@@ -625,7 +675,7 @@ def main():
         f"{volatility_pct_display:.2f}",
     )
 
-    # --- Save/Load Scenarios ---
+    # --- Save/Load Scenarios (parameters only, portfolio separate) ---
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("💾 Save / Load Scenarios")
@@ -698,7 +748,7 @@ def main():
 
     current_age = st.session_state.current_age
     retirement_age = st.session_state.retirement_age
-    current_portfolio = st.session_state.current_portfolio
+    current_portfolio_for_projection = st.session_state.current_portfolio
     monthly_invest = st.session_state.monthly_invest
     annual_bonus_invest = st.session_state.annual_bonus
     target_monthly_spend = st.session_state.target_monthly_spend
@@ -707,16 +757,6 @@ def main():
     early_retirement_age = st.session_state.early_ret_age
     mc_runs = int(st.session_state.mc_runs)
     simulate_crash = st.session_state.simulate_crash
-    alloc_source = st.session_state.alloc_source
-
-    # Rebuild allocation dict from either manual or portfolio-derived (already set above)
-    alloc_dict_final = {
-        "stocks": aa_stocks,
-        "bonds": aa_bonds,
-        "reit": aa_reit,
-        "gold": aa_gold,
-        "cash": aa_cash,
-    }
 
     crash_year_offset = st.session_state.get("crash_year_offset") if simulate_crash else None
     crash_drawdown = (st.session_state.get("crash_drawdown_pct", 37.0) / 100.0) if simulate_crash else 0.0
@@ -727,7 +767,7 @@ def main():
         name="Base",
         current_age=current_age,
         retirement_age=retirement_age,
-        current_portfolio=current_portfolio,
+        current_portfolio=current_portfolio_for_projection,
         monthly_invest=monthly_invest,
         annual_bonus_invest=annual_bonus_invest,
         one_time_injections=one_time_injections,
@@ -743,7 +783,7 @@ def main():
         name="Conservative",
         current_age=current_age,
         retirement_age=retirement_age,
-        current_portfolio=current_portfolio,
+        current_portfolio=current_portfolio_for_projection,
         monthly_invest=monthly_invest,
         annual_bonus_invest=annual_bonus_invest,
         one_time_injections=one_time_injections,
@@ -759,7 +799,7 @@ def main():
         name="Aggressive",
         current_age=current_age,
         retirement_age=retirement_age,
-        current_portfolio=current_portfolio,
+        current_portfolio=current_portfolio_for_projection,
         monthly_invest=monthly_invest,
         annual_bonus_invest=annual_bonus_invest,
         one_time_injections=one_time_injections,
@@ -883,7 +923,7 @@ def main():
         st.subheader("🎲 Monte Carlo Simulation (Base Scenario)")
 
         mc = monte_carlo_simulation(
-            current_portfolio=current_portfolio,
+            current_portfolio=current_portfolio_for_projection,
             monthly_invest=monthly_invest,
             annual_bonus=annual_bonus_invest,
             one_time_injections=one_time_injections,
@@ -928,7 +968,7 @@ def main():
         st.metric("Probability of Reaching FI by Retirement", f"{prob_fi:.1f}%")
 
     st.markdown("---")
-    st.caption("Built for Klaas' FI obsession 🧮. Now reading your real holdings live.")
+    st.caption("Built for Klaas' FI obsession 🧮. Portfolio is now remembered in your browser.")
 
 
 if __name__ == "__main__":
