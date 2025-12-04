@@ -30,7 +30,7 @@ if "portfolio_df" not in st.session_state:
     st.session_state["portfolio_df"] = pd.DataFrame(
         [
             {"Ticker": "VWCE.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
-            {"Ticker": "AGGH.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
+            {"Ticker": "MWRD.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
         ]
     )
 
@@ -1108,3 +1108,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
