@@ -357,26 +357,38 @@ def allocation_from_portfolio(df: pd.DataFrame) -> dict:
 
 def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataFrame:
     """
-    Build a daily history of total portfolio value over a given period
-    based on the CURRENT tickers + shares in the table.
-
-    period examples: '3mo', '6mo', '1y', '2y'
+    Bulletproof: Builds a history of total portfolio value based on current tickers + shares.
+    Handles:
+    - single ticker
+    - multi-index columns
+    - missing Adj Close
+    - .DE / .MI / .AS / .PA tickers
+    - partially failing tickers
     """
+
     df = df.copy()
 
-    # Only tickers with positive shares
-    if "Shares" not in df.columns or "Ticker" not in df.columns:
+    # Validate required columns
+    if "Ticker" not in df.columns or "Shares" not in df.columns:
         return pd.DataFrame()
 
+    # Only keep rows with ticker + positive shares
+    df = df[df["Ticker"].astype(str).str.strip() != ""]
     df = df[df["Shares"].astype(float) > 0]
+
     if df.empty:
         return pd.DataFrame()
 
+    # Tickers + share map
     tickers = df["Ticker"].astype(str).str.strip().tolist()
-    shares_map = dict(zip(df["Ticker"].astype(str).str.strip(), df["Shares"].astype(float)))
+    shares_map = dict(zip(
+        df["Ticker"].astype(str).str.strip(),
+        df["Shares"].astype(float)
+    ))
 
+    # Try downloading price history
     try:
-        price_data = yf.download(
+        raw = yf.download(
             tickers,
             period=period,
             interval="1d",
@@ -384,36 +396,51 @@ def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataF
             progress=False,
         )
     except Exception as e:
-        st.error(f"Could not download history for portfolio: {e}")
+        st.error(f"Error downloading historical prices: {e}")
         return pd.DataFrame()
 
-    # Handle single vs multiple tickers structure
-    if isinstance(price_data, pd.DataFrame) and "Adj Close" in price_data.columns:
-        close = price_data["Adj Close"]
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    # Extract close prices (Adj Close preferred)
+    if isinstance(raw.columns, pd.MultiIndex):
+        # Some tickers may have missing data → filter columns that exist
+        if "Adj Close" in raw.columns.levels[0]:
+            close = raw["Adj Close"]
+        elif "Close" in raw.columns.levels[0]:
+            close = raw["Close"]
+        else:
+            return pd.DataFrame()
     else:
-        close = price_data
+        # Single ticker case
+        if "Adj Close" in raw.columns:
+            close = raw["Adj Close"].to_frame()
+        elif "Close" in raw.columns:
+            close = raw["Close"].to_frame()
+        else:
+            return pd.DataFrame()
 
-    # If single ticker, make it a DataFrame
-    if isinstance(close, pd.Series):
-        close = close.to_frame(name=tickers[0])
-
-    # Align columns with tickers present in shares_map
-    cols = [c for c in close.columns if c in shares_map]
-    if not cols:
+    # Keep only columns that match tickers + shares_map
+    valid_cols = [c for c in close.columns if c in shares_map]
+    if not valid_cols:
         return pd.DataFrame()
 
-    close = close[cols]
+    close = close[valid_cols]
 
-    # Multiply each ticker's price by its shares
-    for ticker in cols:
-        close[ticker] = close[ticker] * shares_map[ticker]
+    # Multiply prices × shares
+    for t in valid_cols:
+        close[t] = close[t] * shares_map[t]
 
-    # Sum across tickers -> total portfolio value per day
+    # Build final portfolio value series
     portfolio_series = close.sum(axis=1)
-    hist_df = pd.DataFrame({"Date": portfolio_series.index, "PortfolioValue": portfolio_series.values})
-    hist_df.set_index("Date", inplace=True)
 
-    return hist_df
+    hist = pd.DataFrame({
+        "Date": portfolio_series.index,
+        "PortfolioValue": portfolio_series.values
+    }).set_index("Date")
+
+    return hist
+
 
 
 # ---------- LocalStorage Helpers (browser persistence) ----------
