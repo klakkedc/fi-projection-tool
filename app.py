@@ -29,8 +29,8 @@ if "active_scenario" not in st.session_state:
 if "portfolio_df" not in st.session_state:
     st.session_state["portfolio_df"] = pd.DataFrame(
         [
-            {"Ticker": "MWRD.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
             {"Ticker": "VWCE.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
+            {"Ticker": "AGGH.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
         ]
     )
 
@@ -460,11 +460,24 @@ def main():
     st.set_page_config(page_title="FI & Portfolio Projection", layout="wide")
     st.title("📈 Financial Independence & Portfolio Projection Tool")
 
-    # Try to load portfolio from browser storage on each run (no harm if empty)
-    try:
-        load_portfolio_from_localstorage()
-    except Exception as e:
-        st.warning(f"Could not load portfolio from local storage: {e}")
+    # Only load from localStorage once per session
+    if "portfolio_initialized" not in st.session_state:
+        try:
+            load_portfolio_from_localstorage()
+        except Exception as e:
+            st.warning(f"Could not load portfolio from local storage: {e}")
+
+        # If still nothing set, keep or create default
+        if "portfolio_df" not in st.session_state or st.session_state["portfolio_df"].empty:
+            st.session_state["portfolio_df"] = pd.DataFrame(
+                [
+                    {"Ticker": "VWCE.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
+                    {"Ticker": "AGGH.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
+                ]
+            )
+
+        st.session_state["portfolio_initialized"] = True
+
 
     st.markdown(
         """
@@ -1068,4 +1081,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
