@@ -1,4 +1,5 @@
 streamlit
-panda
+pandas
 numpy
 yfinance
+streamlit-js-eval
