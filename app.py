@@ -1070,7 +1070,7 @@ def main():
             )
         else:
             st.markdown(
-                "❌ In the **base scenario**, you do **not** reach FI before your chosen retirement age. "<f
+                "❌ In the **base scenario**, you do **not** reach FI before your chosen retirement age. "
                 "Try increasing monthly investing, bonuses, or expected return, or lowering target spending."
             )
 
@@ -1128,3 +1128,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
