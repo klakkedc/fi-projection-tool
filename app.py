@@ -648,19 +648,19 @@ def main():
         step=1,
         key="retirement_age",
     )
-     # Starting portfolio for projection + sync button
+
+    # Starting portfolio for projection + sync button
     st.sidebar.subheader("📦 Starting portfolio for projection")
 
     col_start_val, col_sync = st.sidebar.columns([2, 1])
 
-    # 1) Handle sync button FIRST (update session_state before widget is created)
+    # Handle sync first
     with col_sync:
         sync_clicked = st.sidebar.button("Sync\nfrom table")
         if sync_clicked:
             st.session_state["current_portfolio"] = float(total_portfolio_value)
             st.sidebar.success("Synced from portfolio table ✔")
 
-    # 2) Then create the number input, using session_state if available
     default_start_value = st.session_state.get(
         "current_portfolio",
         float(total_portfolio_value or 10000.0),
@@ -675,8 +675,6 @@ def main():
             key="current_portfolio",
         )
 
-
-   
     monthly_invest = st.sidebar.number_input(
         "Monthly Investment (€)", min_value=0.0, step=50.0, value=1000.0, key="monthly_invest"
     )
@@ -776,6 +774,48 @@ def main():
 
     alloc_return, alloc_vol = compute_portfolio_from_allocation(alloc_dict)
 
+    # --- Contribution allocation section (for new money) ---
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📥 Contribution allocation (for new money)")
+
+    ca_stocks = st.sidebar.slider(
+        "Stocks (%) [contrib]", 0, 100, aa_stocks, step=5, key="ca_stocks"
+    )
+    ca_bonds = st.sidebar.slider(
+        "Bonds (%) [contrib]", 0, 100, aa_bonds, step=5, key="ca_bonds"
+    )
+    ca_reit = st.sidebar.slider(
+        "REITs (%) [contrib]", 0, 100, aa_reit, step=5, key="ca_reit"
+    )
+    ca_gold = st.sidebar.slider(
+        "Gold (%) [contrib]", 0, 100, aa_gold, step=5, key="ca_gold"
+    )
+    ca_cash = st.sidebar.slider(
+        "Cash (%) [contrib]", 0, 100, aa_cash, step=5, key="ca_cash"
+    )
+    ca_crypto = st.sidebar.slider(
+        "Crypto (%) [contrib]", 0, 100, aa_crypto, step=5, key="ca_crypto"
+    )
+
+    contrib_alloc_dict = {
+        "stocks": ca_stocks,
+        "bonds": ca_bonds,
+        "reit": ca_reit,
+        "gold": ca_gold,
+        "cash": ca_cash,
+        "crypto": ca_crypto,
+    }
+
+    contrib_return, contrib_vol = compute_portfolio_from_allocation(contrib_alloc_dict)
+
+    use_contrib_alloc_for_return = st.sidebar.checkbox(
+        "Use contribution allocation for return/vol",
+        value=True,
+        key="use_contrib_alloc_for_return",
+        help="If checked, the expected return/vol used in projections is based on how you invest new money.",
+    )
+
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧨 Historical Crash Scenario")
 
@@ -803,38 +843,34 @@ def main():
         crash_drawdown = crash_drawdown_pct / 100.0
 
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🎁 One-Time Extra Injection")
+    st.sidebar.subheader("🎁 One-time extra contributions")
 
-    extra_5k_enabled = st.sidebar.checkbox(
-        "Include one-time €5k next year", value=True, key="extra_5k"
-    )
     one_time_injections: List[OneTimeInjection] = []
-    if st.session_state.extra_5k:
-        one_time_injections.append(OneTimeInjection(year_offset=1, amount=5000.0))
 
-    with st.sidebar.expander("➕ Add Custom Injection"):
+    with st.sidebar.expander("➕ Add one-time contribution"):
         custom_amount = st.number_input(
-            "Custom Injection Amount (€)",
+            "Amount (€)",
             min_value=0.0,
             step=500.0,
             value=0.0,
             key="custom_inj_amount",
         )
         custom_year_offset = st.number_input(
-            "Year Offset (1 = end of first projected year)",
+            "Year offset (1 = end of first projected year)",
             min_value=1,
             max_value=max(1, st.session_state.retirement_age - st.session_state.current_age),
-            value=2,
+            value=1,
             step=1,
             key="custom_inj_year",
         )
         if custom_amount > 0:
             one_time_injections.append(
                 OneTimeInjection(
-                    year_offset=int(st.session_state.custom_inj_year),
-                    amount=custom_amount,
+                    year_offset=int(custom_year_offset),
+                    amount=float(custom_amount),
                 )
             )
+
 
     early_retirement_age = st.sidebar.slider(
         "Early Retirement Age (for analysis)",
@@ -859,19 +895,26 @@ def main():
         key="volatility_pct",
     )
 
-    # Decide whether to use allocation-derived or manual return/vol
+    # Decide baseline return/vol from allocation or manual
     use_allocation = alloc_source == "Use my portfolio"
 
     if use_allocation:
-        annual_return = alloc_return
-        annual_return_pct_display = annual_return * 100
-        annual_volatility = alloc_vol
-        volatility_pct_display = annual_volatility * 100
+        base_return = alloc_return
+        base_vol = alloc_vol
     else:
-        annual_return = annual_return_pct_manual / 100.0
-        annual_return_pct_display = annual_return_pct_manual
-        annual_volatility = volatility_pct_manual / 100.0
-        volatility_pct_display = volatility_pct_manual
+        base_return = annual_return_pct_manual / 100.0
+        base_vol = volatility_pct_manual / 100.0
+
+    # Now optionally override with contribution allocation
+    if use_contrib_alloc_for_return and contrib_return > 0:
+        annual_return = contrib_return
+        annual_volatility = contrib_vol
+    else:
+        annual_return = base_return
+        annual_volatility = base_vol
+
+    annual_return_pct_display = annual_return * 100
+    volatility_pct_display = annual_volatility * 100
 
     st.sidebar.metric("Effective Annual Return (%)", f"{annual_return_pct_display:.2f}")
     st.sidebar.metric("Effective Volatility (%)", f"{volatility_pct_display:.2f}")
@@ -905,7 +948,6 @@ def main():
                 "swr_pct": st.session_state.swr_pct,
                 "use_inflation": st.session_state.use_inflation,
                 "inflation_pct": st.session_state.inflation_pct,
-                "extra_5k": st.session_state.extra_5k,
                 "custom_inj_amount": st.session_state.custom_inj_amount,
                 "custom_inj_year": st.session_state.custom_inj_year,
                 "early_ret_age": st.session_state.early_ret_age,
@@ -921,6 +963,13 @@ def main():
                 "aa_gold": aa_gold,
                 "aa_cash": aa_cash,
                 "aa_crypto": aa_crypto,
+                "ca_stocks": ca_stocks,
+                "ca_bonds": ca_bonds,
+                "ca_reit": ca_reit,
+                "ca_gold": ca_gold,
+                "ca_cash": ca_cash,
+                "ca_crypto": ca_crypto,
+                "use_contrib_alloc_for_return": st.session_state.use_contrib_alloc_for_return,
             }
             st.session_state["active_scenario"] = scenario_name.strip()
             st.sidebar.success(f"Saved scenario '{scenario_name.strip()}'")
@@ -1114,7 +1163,7 @@ def main():
         st.line_chart(chart_df)
 
         st.markdown(
-            "- **Base**: your chosen (or allocation-derived) return.\n"
+            "- **Base**: return driven by your chosen/contribution allocation.\n"
             "- **Conservative**: return - 2 percentage points.\n"
             "- **Aggressive**: return + 2 percentage points.\n"
             "- Crash (if enabled) is applied in the chosen year **after** contributions."
@@ -1180,10 +1229,9 @@ def main():
     st.markdown("---")
     st.caption(
         "Built for Klaas' FI obsession 🧮. Portfolio (including crypto) is remembered in your browser, "
-        "performance charted from real EUR prices."
+        "and contributions now follow your own allocation for new money."
     )
 
 
 if __name__ == "__main__":
     main()
-
