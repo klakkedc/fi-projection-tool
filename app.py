@@ -468,6 +468,76 @@ def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataF
 
     return hist
 
+def compute_correlation_matrix_from_portfolio(df: pd.DataFrame, period: str = "1y") -> pd.DataFrame:
+    """
+    Computes a correlation matrix of daily returns for all tickers in the portfolio.
+    - Uses adjusted close prices where available.
+    - Filters out empty tickers / zero-share rows.
+    """
+    df = df.copy()
+
+    if "Ticker" not in df.columns:
+        return pd.DataFrame()
+
+    # Use all non-empty tickers, even if Shares = 0, since correlation is independent of size
+    df = df[df["Ticker"].astype(str).str.strip() != ""]
+    if df.empty:
+        return pd.DataFrame()
+
+    tickers = df["Ticker"].astype(str).str.strip().tolist()
+
+    try:
+        raw = yf.download(
+            tickers,
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception as e:
+        st.error(f"Error downloading historical prices for correlation: {e}")
+        return pd.DataFrame()
+
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    # Extract close/adj close
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Adj Close" in raw.columns.levels[0]:
+            close = raw["Adj Close"]
+        elif "Close" in raw.columns.levels[0]:
+            close = raw["Close"]
+        else:
+            return pd.DataFrame()
+    else:
+        if "Adj Close" in raw.columns:
+            close = raw["Adj Close"].to_frame()
+        elif "Close" in raw.columns:
+            close = raw["Close"].to_frame()
+        else:
+            return pd.DataFrame()
+
+    # Keep only columns we requested
+    close = close[[c for c in close.columns if c in tickers]]
+
+    if close.empty:
+        return pd.DataFrame()
+
+    # Daily returns
+    returns = close.pct_change().dropna(how="all")
+
+    # Drop columns that are all NaN
+    returns = returns.dropna(axis=1, how="all")
+
+    if returns.empty or returns.shape[1] < 2:
+        # Need at least 2 assets to compute correlation
+        return pd.DataFrame()
+
+    corr = returns.corr()
+
+    return corr
+
+
 
 # ---------- LocalStorage Helpers (browser persistence) ----------
 
@@ -628,6 +698,75 @@ def main():
                     f"Start: **€{start_val:,.0f}** → End: **€{end_val:,.0f}** "
                     f"({change_pct:+.1f}%) over **{period}**."
                 )
+def compute_correlation_matrix_from_portfolio(df: pd.DataFrame, period: str = "1y") -> pd.DataFrame:
+    """
+    Computes a correlation matrix of daily returns for all tickers in the portfolio.
+    - Uses adjusted close prices where available.
+    - Filters out empty tickers / zero-share rows.
+    """
+    df = df.copy()
+
+    if "Ticker" not in df.columns:
+        return pd.DataFrame()
+
+    # Use all non-empty tickers, even if Shares = 0, since correlation is independent of size
+    df = df[df["Ticker"].astype(str).str.strip() != ""]
+    if df.empty:
+        return pd.DataFrame()
+
+    tickers = df["Ticker"].astype(str).str.strip().tolist()
+
+    try:
+        raw = yf.download(
+            tickers,
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception as e:
+        st.error(f"Error downloading historical prices for correlation: {e}")
+        return pd.DataFrame()
+
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    # Extract close/adj close
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Adj Close" in raw.columns.levels[0]:
+            close = raw["Adj Close"]
+        elif "Close" in raw.columns.levels[0]:
+            close = raw["Close"]
+        else:
+            return pd.DataFrame()
+    else:
+        if "Adj Close" in raw.columns:
+            close = raw["Adj Close"].to_frame()
+        elif "Close" in raw.columns:
+            close = raw["Close"].to_frame()
+        else:
+            return pd.DataFrame()
+
+    # Keep only columns we requested
+    close = close[[c for c in close.columns if c in tickers]]
+
+    if close.empty:
+        return pd.DataFrame()
+
+    # Daily returns
+    returns = close.pct_change().dropna(how="all")
+
+    # Drop columns that are all NaN
+    returns = returns.dropna(axis=1, how="all")
+
+    if returns.empty or returns.shape[1] < 2:
+        # Need at least 2 assets to compute correlation
+        return pd.DataFrame()
+
+    corr = returns.corr()
+
+    return corr
+
 
     # Derive allocation from portfolio (for use-my-portfolio mode)
     portfolio_alloc = allocation_from_portfolio(portfolio_df)
