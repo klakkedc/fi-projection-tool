@@ -30,7 +30,7 @@ if "portfolio_df" not in st.session_state:
     st.session_state["portfolio_df"] = pd.DataFrame(
         [
             {"Ticker": "VWCE.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
-            {"Ticker": "MWRD.PA", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
+            {"Ticker": "AGGH.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
         ]
     )
 
@@ -236,23 +236,24 @@ def monte_carlo_simulation(
 
 def compute_portfolio_from_allocation(weights_pct: dict):
     """
-    weights_pct: dict with keys 'stocks','bonds','reit','gold','cash' in %
+    weights_pct: dict with keys 'stocks','bonds','reit','gold','cash','crypto' in %
     Returns (expected_return, volatility)
     """
-    labels = ["stocks", "bonds", "reit", "gold", "cash"]
+    labels = ["stocks", "bonds", "reit", "gold", "cash", "crypto"]
     w = np.array([weights_pct.get(k, 0.0) for k in labels], dtype=float)
     total = w.sum()
     if total <= 0:
         return 0.0, 0.0
     w = w / total
 
-    # Reasonable long-term assumptions
+    # Rough long-term assumptions
     mu = np.array([
         0.07,  # stocks
         0.02,  # bonds
         0.06,  # REIT
         0.03,  # gold
         0.01,  # cash
+        0.15,  # crypto
     ])
 
     sigma = np.array([
@@ -261,14 +262,16 @@ def compute_portfolio_from_allocation(weights_pct: dict):
         0.16,  # REIT
         0.15,  # gold
         0.01,  # cash
+        0.80,  # crypto
     ])
 
     corr = np.array([
-        [1.00,  0.10, 0.70, 0.20, 0.00],
-        [0.10,  1.00, 0.20, 0.00, 0.10],
-        [0.70,  0.20, 1.00, 0.25, 0.00],
-        [0.20,  0.00, 0.25, 1.00, 0.00],
-        [0.00,  0.10, 0.00, 0.00, 1.00],
+        [1.00,  0.10, 0.70, 0.20, 0.00, 0.30],  # stocks
+        [0.10,  1.00, 0.20, 0.00, 0.10, 0.00],  # bonds
+        [0.70,  0.20, 1.00, 0.25, 0.00, 0.30],  # REIT
+        [0.20,  0.00, 0.25, 1.00, 0.00, 0.10],  # gold
+        [0.00,  0.10, 0.00, 0.00, 1.00, 0.00],  # cash
+        [0.30,  0.00, 0.30, 0.10, 0.00, 1.00],  # crypto
     ])
 
     cov = np.outer(sigma, sigma) * corr
@@ -282,16 +285,29 @@ def compute_portfolio_from_allocation(weights_pct: dict):
 
 # ---------- Portfolio Helpers ----------
 
-ASSET_CLASSES = ["Stocks", "Bonds", "REIT", "Gold", "Cash"]
+ASSET_CLASSES = ["Stocks", "Bonds", "REIT", "Gold", "Cash", "Crypto"]
 LOCALSTORAGE_KEY = "fi_portfolio_v1"
 
 
 def fetch_prices_for_portfolio(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Simple price fetch: 1d history per ticker.
-    Shows warnings if something fails but keeps app usable.
+    Fetch live prices for stocks/ETFs/crypto and compute Value & Weight.
+    - All values in EUR.
+    - Crypto tickers assumed as *-USD (e.g. BTC-USD, ETH-USD) and converted to EUR.
     """
     df = df.copy()
+
+    # Get EURUSD rate once (USD per 1 EUR)
+    eurusd_rate = 1.0
+    try:
+        fx = yf.Ticker("EURUSD=X")
+        fx_hist = fx.history(period="1d")
+        if not fx_hist.empty:
+            eurusd_rate = float(fx_hist["Close"].iloc[-1])
+        else:
+            st.warning("⚠️ Could not fetch EURUSD rate, assuming 1.0 (prices may be off).")
+    except Exception as e:
+        st.warning(f"⚠️ Error fetching EURUSD rate, assuming 1.0: {e}")
 
     prices = []
     values = []
@@ -300,21 +316,32 @@ def fetch_prices_for_portfolio(df: pd.DataFrame) -> pd.DataFrame:
         ticker = str(row["Ticker"]).strip()
         shares = float(row.get("Shares", 0.0) or 0.0)
 
-        price = 0.0
+        price_eur = 0.0
 
         if ticker:
             try:
                 t = yf.Ticker(ticker)
                 hist = t.history(period="1d")
+
                 if not hist.empty:
-                    price = float(hist["Close"].iloc[-1])
+                    last_close = float(hist["Close"].iloc[-1])
+
+                    # Crypto tickers in USD: convert to EUR
+                    if ticker.endswith("-USD"):
+                        if eurusd_rate > 0:
+                            price_eur = last_close / eurusd_rate
+                        else:
+                            price_eur = last_close
+                    else:
+                        # For European / local tickers, price is already in EUR
+                        price_eur = last_close
                 else:
                     st.warning(f"⚠️ No price data returned for {ticker}.")
             except Exception as e:
                 st.warning(f"⚠️ Could not fetch price for {ticker}: {e}")
 
-        value = price * shares
-        prices.append(price)
+        value = price_eur * shares
+        prices.append(price_eur)
         values.append(value)
 
     df["Price"] = prices
@@ -338,7 +365,7 @@ def allocation_from_portfolio(df: pd.DataFrame) -> dict:
     Aggregate portfolio by asset class -> % weights dict.
     """
     if df.empty or df["Value"].sum() <= 0:
-        return {"stocks": 0, "bonds": 0, "reit": 0, "gold": 0, "cash": 0}
+        return {"stocks": 0, "bonds": 0, "reit": 0, "gold": 0, "cash": 0, "crypto": 0}
 
     grp = df.groupby("Class")["Value"].sum()
     total = grp.sum()
@@ -350,6 +377,7 @@ def allocation_from_portfolio(df: pd.DataFrame) -> dict:
         "reit": float(weights.get("REIT", 0.0) * 100),
         "gold": float(weights.get("Gold", 0.0) * 100),
         "cash": float(weights.get("Cash", 0.0) * 100),
+        "crypto": float(weights.get("Crypto", 0.0) * 100),
     }
 
 
@@ -362,31 +390,25 @@ def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataF
     - single ticker
     - multi-index columns
     - missing Adj Close
-    - .DE / .MI / .AS / .PA tickers
     - partially failing tickers
+    - forward-fill + outlier cleaning
     """
-
     df = df.copy()
 
-    # Validate required columns
     if "Ticker" not in df.columns or "Shares" not in df.columns:
         return pd.DataFrame()
 
-    # Only keep rows with ticker + positive shares
     df = df[df["Ticker"].astype(str).str.strip() != ""]
     df = df[df["Shares"].astype(float) > 0]
 
     if df.empty:
         return pd.DataFrame()
 
-    # Tickers + share map
     tickers = df["Ticker"].astype(str).str.strip().tolist()
-    shares_map = dict(zip(
-        df["Ticker"].astype(str).str.strip(),
-        df["Shares"].astype(float)
-    ))
+    shares_map = dict(
+        zip(df["Ticker"].astype(str).str.strip(), df["Shares"].astype(float))
+    )
 
-    # Try downloading price history
     try:
         raw = yf.download(
             tickers,
@@ -402,9 +424,8 @@ def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataF
     if raw is None or raw.empty:
         return pd.DataFrame()
 
-    # Extract close prices (Adj Close preferred)
+    # Extract close/adj close
     if isinstance(raw.columns, pd.MultiIndex):
-        # Some tickers may have missing data → filter columns that exist
         if "Adj Close" in raw.columns.levels[0]:
             close = raw["Adj Close"]
         elif "Close" in raw.columns.levels[0]:
@@ -412,7 +433,6 @@ def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataF
         else:
             return pd.DataFrame()
     else:
-        # Single ticker case
         if "Adj Close" in raw.columns:
             close = raw["Adj Close"].to_frame()
         elif "Close" in raw.columns:
@@ -420,47 +440,33 @@ def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataF
         else:
             return pd.DataFrame()
 
-    # Keep only columns that match tickers + shares_map
     valid_cols = [c for c in close.columns if c in shares_map]
     if not valid_cols:
         return pd.DataFrame()
 
     close = close[valid_cols]
 
-    # 🔧 Fix: fill missing prices forward so gaps don't create fake crashes
+    # Fill missing prices forward & drop completely empty rows
     close = close.ffill().dropna(how="all")
 
-  
-
-    # Multiply prices × shares
+    # Multiply by shares
     for t in valid_cols:
         close[t] = close[t] * shares_map[t]
 
-    # Build final portfolio value series
     portfolio_series = close.sum(axis=1)
 
-    hist = pd.DataFrame({
-        "Date": portfolio_series.index,
-        "PortfolioValue": portfolio_series.values
-    }).set_index("Date")
+    hist = pd.DataFrame(
+        {"Date": portfolio_series.index, "PortfolioValue": portfolio_series.values}
+    ).set_index("Date")
 
-    # 🔧 Remove unrealistic one-day jumps created by Yahoo glitches
-    # Compute daily returns
+    # Remove unrealistic single-day jumps (e.g. data glitches)
     hist["Return"] = hist["PortfolioValue"].pct_change()
-
-    # Identify outliers (you can adjust threshold)
-    outliers = hist["Return"].abs() > 0.08   # > 8% daily move = bad data
-
-    # Forward-fill only the bad values
+    outliers = hist["Return"].abs() > 0.08  # > 8% daily = treat as bad data
     hist.loc[outliers, "PortfolioValue"] = np.nan
     hist["PortfolioValue"] = hist["PortfolioValue"].ffill()
-
-    # Drop the temporary column
     hist = hist.drop(columns=["Return"])
-	
 
     return hist
-
 
 
 # ---------- LocalStorage Helpers (browser persistence) ----------
@@ -471,7 +477,7 @@ def load_portfolio_from_localstorage():
     and loads it into st.session_state["portfolio_df"].
     """
     stored = streamlit_js_eval(
-        js_expressions="window.localStorage.getItem('" + LOCALSTORAGE_KEY + "')",
+        js_expressions=f"window.localStorage.getItem('{LOCALSTORAGE_KEY}')",
         key="load_portfolio",
         want_output=True,
     )
@@ -486,17 +492,13 @@ def load_portfolio_from_localstorage():
 
 def save_portfolio_to_localstorage(df: pd.DataFrame):
     """
-    Saves the current portfolio dataframe to browser localStorage
-    as a JSON string.
+    Saves the current portfolio dataframe to browser localStorage as JSON.
     """
     try:
         json_str = df.to_json()
         js_code = f"window.localStorage.setItem('{LOCALSTORAGE_KEY}', {json.dumps(json_str)});"
-
-        # Use unique key each time to avoid Streamlit duplicate-key errors
         unique_key = f"save_portfolio_{np.random.randint(0, 1_000_000)}"
         streamlit_js_eval(js_expressions=js_code, key=unique_key)
-
     except Exception as e:
         st.warning(f"Could not save portfolio to localStorage: {e}")
 
@@ -507,31 +509,41 @@ def main():
     st.set_page_config(page_title="FI & Portfolio Projection", layout="wide")
     st.title("📈 Financial Independence & Portfolio Projection Tool")
 
-    # Only load from localStorage once per session
+    # Load portfolio once per session from localStorage if present
     if "portfolio_initialized" not in st.session_state:
         try:
             load_portfolio_from_localstorage()
         except Exception as e:
             st.warning(f"Could not load portfolio from local storage: {e}")
 
-        # If still nothing set, keep or create default
         if "portfolio_df" not in st.session_state or st.session_state["portfolio_df"].empty:
             st.session_state["portfolio_df"] = pd.DataFrame(
                 [
-                    {"Ticker": "VWCE.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Stocks"},
-                    {"Ticker": "AGGH.DE", "Shares": 10.0, "Price": 0.0, "Value": 0.0, "Class": "Bonds"},
+                    {
+                        "Ticker": "VWCE.DE",
+                        "Shares": 10.0,
+                        "Price": 0.0,
+                        "Value": 0.0,
+                        "Class": "Stocks",
+                    },
+                    {
+                        "Ticker": "AGGH.DE",
+                        "Shares": 10.0,
+                        "Price": 0.0,
+                        "Value": 0.0,
+                        "Class": "Bonds",
+                    },
                 ]
             )
 
         st.session_state["portfolio_initialized"] = True
-
 
     st.markdown(
         """
         This tool projects your portfolio year by year, calculates your **FI number**,  
         estimates your **FI age**, **Coast FI age**, and runs a **Monte Carlo simulation**  
         including an optional **historical crash scenario** and an **asset allocation engine**  
-        that can derive returns from your **real portfolio holdings**.
+        that can derive returns from your **real portfolio holdings** (including crypto) in **EUR**.
         """
     )
 
@@ -543,6 +555,7 @@ def main():
         "Enter your tickers and number of shares. "
         "Click **Fetch live prices** to update values. "
         "Choose the asset class per row to feed the allocation engine.\n\n"
+        "You can also add **crypto** like `BTC-USD`, `ETH-USD` (values converted to EUR).\n\n"
         "_Your portfolio is automatically saved in this browser and will be restored next time._"
     )
 
@@ -562,12 +575,13 @@ def main():
             use_container_width=True,
         )
 
-        # Update session state and save to browser storage
         st.session_state["portfolio_df"] = edited_df
         save_portfolio_to_localstorage(st.session_state["portfolio_df"])
 
         if st.button("🔄 Fetch live prices"):
-            st.session_state["portfolio_df"] = fetch_prices_for_portfolio(st.session_state["portfolio_df"])
+            st.session_state["portfolio_df"] = fetch_prices_for_portfolio(
+                st.session_state["portfolio_df"]
+            )
             save_portfolio_to_localstorage(st.session_state["portfolio_df"])
 
     portfolio_df = st.session_state["portfolio_df"]
@@ -589,12 +603,15 @@ def main():
             use_container_width=True,
         )
 
-    # --- NEW: Historical performance chart ---
-    with st.expander("📈 Historical performance of this portfolio (based on past prices)", expanded=False):
+    # --- Historical performance chart ---
+
+    with st.expander(
+        "📈 Historical performance of this portfolio (based on past prices)", expanded=False
+    ):
         period = st.selectbox(
             "Period",
             options=["3mo", "6mo", "1y", "2y"],
-            index=1,  # default 6mo
+            index=1,
             key="hist_period",
         )
 
@@ -631,15 +648,35 @@ def main():
         step=1,
         key="retirement_age",
     )
+     # Starting portfolio for projection + sync button
+    st.sidebar.subheader("📦 Starting portfolio for projection")
 
-    current_portfolio_input = st.sidebar.number_input(
-        "Current Portfolio for Projection (€)",
-        min_value=0.0,
-        step=1000.0,
-        value=float(total_portfolio_value or 44327.73),
-        key="current_portfolio",
+    col_start_val, col_sync = st.sidebar.columns([2, 1])
+
+    # 1) Handle sync button FIRST (update session_state before widget is created)
+    with col_sync:
+        sync_clicked = st.sidebar.button("Sync\nfrom table")
+        if sync_clicked:
+            st.session_state["current_portfolio"] = float(total_portfolio_value)
+            st.sidebar.success("Synced from portfolio table ✔")
+
+    # 2) Then create the number input, using session_state if available
+    default_start_value = st.session_state.get(
+        "current_portfolio",
+        float(total_portfolio_value or 10000.0),
     )
 
+    with col_start_val:
+        current_portfolio_input = st.sidebar.number_input(
+            "Current Portfolio for Projection (€)",
+            min_value=0.0,
+            step=500.0,
+            value=default_start_value,
+            key="current_portfolio",
+        )
+
+
+   
     monthly_invest = st.sidebar.number_input(
         "Monthly Investment (€)", min_value=0.0, step=50.0, value=1000.0, key="monthly_invest"
     )
@@ -680,7 +717,9 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧯 Inflation")
 
-    use_inflation = st.sidebar.checkbox("Adjust FI number for inflation", value=True, key="use_inflation")
+    use_inflation = st.sidebar.checkbox(
+        "Adjust FI number for inflation", value=True, key="use_inflation"
+    )
     inflation_rate_pct = st.sidebar.number_input(
         "Inflation Rate (%)",
         min_value=0.0,
@@ -706,12 +745,14 @@ def main():
         aa_reit = st.sidebar.slider("REITs (%)", 0, 100, 5, step=5, key="aa_reit")
         aa_gold = st.sidebar.slider("Gold (%)", 0, 100, 5, step=5, key="aa_gold")
         aa_cash = st.sidebar.slider("Cash (%)", 0, 100, 0, step=5, key="aa_cash")
+        aa_crypto = st.sidebar.slider("Crypto (%)", 0, 100, 0, step=5, key="aa_crypto")
     else:
         aa_stocks = int(round(portfolio_alloc["stocks"]))
         aa_bonds = int(round(portfolio_alloc["bonds"]))
         aa_reit = int(round(portfolio_alloc["reit"]))
         aa_gold = int(round(portfolio_alloc["gold"]))
         aa_cash = int(round(portfolio_alloc["cash"]))
+        aa_crypto = int(round(portfolio_alloc["crypto"]))
 
         st.sidebar.write("Derived from your portfolio:")
         st.sidebar.write(f"- Stocks: **{aa_stocks}%**")
@@ -719,8 +760,9 @@ def main():
         st.sidebar.write(f"- REIT: **{aa_reit}%**")
         st.sidebar.write(f"- Gold: **{aa_gold}%**")
         st.sidebar.write(f"- Cash: **{aa_cash}%**")
+        st.sidebar.write(f"- Crypto: **{aa_crypto}%**")
 
-    alloc_total = aa_stocks + aa_bonds + aa_reit + aa_gold + aa_cash
+    alloc_total = aa_stocks + aa_bonds + aa_reit + aa_gold + aa_cash + aa_crypto
     st.sidebar.caption(f"Total allocation: **{alloc_total}%** (normalized internally).")
 
     alloc_dict = {
@@ -729,6 +771,7 @@ def main():
         "reit": aa_reit,
         "gold": aa_gold,
         "cash": aa_cash,
+        "crypto": aa_crypto,
     }
 
     alloc_return, alloc_vol = compute_portfolio_from_allocation(alloc_dict)
@@ -762,14 +805,20 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("🎁 One-Time Extra Injection")
 
-    extra_5k_enabled = st.sidebar.checkbox("Include one-time €5k next year", value=True, key="extra_5k")
+    extra_5k_enabled = st.sidebar.checkbox(
+        "Include one-time €5k next year", value=True, key="extra_5k"
+    )
     one_time_injections: List[OneTimeInjection] = []
     if st.session_state.extra_5k:
         one_time_injections.append(OneTimeInjection(year_offset=1, amount=5000.0))
 
     with st.sidebar.expander("➕ Add Custom Injection"):
         custom_amount = st.number_input(
-            "Custom Injection Amount (€)", min_value=0.0, step=500.0, value=0.0, key="custom_inj_amount"
+            "Custom Injection Amount (€)",
+            min_value=0.0,
+            step=500.0,
+            value=0.0,
+            key="custom_inj_amount",
         )
         custom_year_offset = st.number_input(
             "Year Offset (1 = end of first projected year)",
@@ -781,7 +830,10 @@ def main():
         )
         if custom_amount > 0:
             one_time_injections.append(
-                OneTimeInjection(year_offset=int(st.session_state.custom_inj_year), amount=custom_amount)
+                OneTimeInjection(
+                    year_offset=int(st.session_state.custom_inj_year),
+                    amount=custom_amount,
+                )
             )
 
     early_retirement_age = st.sidebar.slider(
@@ -808,7 +860,7 @@ def main():
     )
 
     # Decide whether to use allocation-derived or manual return/vol
-    use_allocation = (alloc_source == "Use my portfolio")
+    use_allocation = alloc_source == "Use my portfolio"
 
     if use_allocation:
         annual_return = alloc_return
@@ -821,14 +873,8 @@ def main():
         annual_volatility = volatility_pct_manual / 100.0
         volatility_pct_display = volatility_pct_manual
 
-    st.sidebar.metric(
-        "Effective Annual Return (%)",
-        f"{annual_return_pct_display:.2f}",
-    )
-    st.sidebar.metric(
-        "Effective Volatility (%)",
-        f"{volatility_pct_display:.2f}",
-    )
+    st.sidebar.metric("Effective Annual Return (%)", f"{annual_return_pct_display:.2f}")
+    st.sidebar.metric("Effective Volatility (%)", f"{volatility_pct_display:.2f}")
 
     # --- Save/Load Scenarios (parameters only, portfolio separate) ---
 
@@ -841,9 +887,7 @@ def main():
 
     saved_names = list(st.session_state["scenarios"].keys())
     load_choice = st.sidebar.selectbox(
-        "Load existing scenario",
-        options=["(none)"] + saved_names,
-        index=0,
+        "Load existing scenario", options=["(none)"] + saved_names, index=0
     )
 
     col_save, col_delete = st.sidebar.columns(2)
@@ -876,6 +920,7 @@ def main():
                 "aa_reit": aa_reit,
                 "aa_gold": aa_gold,
                 "aa_cash": aa_cash,
+                "aa_crypto": aa_crypto,
             }
             st.session_state["active_scenario"] = scenario_name.strip()
             st.sidebar.success(f"Saved scenario '{scenario_name.strip()}'")
@@ -908,13 +953,19 @@ def main():
     annual_bonus_invest = st.session_state.annual_bonus
     target_monthly_spend = st.session_state.target_monthly_spend
     safe_withdrawal_rate = st.session_state.swr_pct / 100.0
-    inflation_rate = (st.session_state.inflation_pct / 100.0) if st.session_state.use_inflation else 0.0
+    inflation_rate = (
+        st.session_state.inflation_pct / 100.0 if st.session_state.use_inflation else 0.0
+    )
     early_retirement_age = st.session_state.early_ret_age
     mc_runs = int(st.session_state.mc_runs)
     simulate_crash = st.session_state.simulate_crash
 
-    crash_year_offset = st.session_state.get("crash_year_offset") if simulate_crash else None
-    crash_drawdown = (st.session_state.get("crash_drawdown_pct", 37.0) / 100.0) if simulate_crash else 0.0
+    crash_year_offset = (
+        st.session_state.get("crash_year_offset") if simulate_crash else None
+    )
+    crash_drawdown = (
+        st.session_state.get("crash_drawdown_pct", 37.0) / 100.0 if simulate_crash else 0.0
+    )
 
     # --- Build scenarios ---
 
@@ -991,7 +1042,10 @@ def main():
         if base_result.fi_age is not None:
             st.success(f"✅ FI reached at age **{base_result.fi_age}**")
         else:
-            st.error("FI not reached before retirement age in base scenario.")
+            st.error(
+                "❌ In the **base scenario**, you do **not** reach FI before your chosen retirement age. "
+                "Try increasing monthly investing, bonuses, or expected return, or lowering target spending."
+            )
 
         if base_result.coast_fi_age is not None:
             st.info(
@@ -1012,7 +1066,9 @@ def main():
         st.markdown("---")
         st.subheader("🧓 Early Retirement Check")
 
-        early_row = next((yr for yr in base_result.years if yr.age == early_retirement_age), None)
+        early_row = next(
+            (yr for yr in base_result.years if yr.age == early_retirement_age), None
+        )
         if early_row:
             st.metric(
                 f"Portfolio at age {early_retirement_age}",
@@ -1050,7 +1106,9 @@ def main():
         chart_data["Age"] = ages_for_chart
 
         for res in scenarios:
-            chart_data[f"{res.params.name} Portfolio"] = [y.portfolio_end for y in res.years]
+            chart_data[f"{res.params.name} Portfolio"] = [
+                y.portfolio_end for y in res.years
+            ]
 
         chart_df = pd.DataFrame(chart_data).set_index("Age")
         st.line_chart(chart_df)
@@ -1067,11 +1125,6 @@ def main():
                 f"✅ In the **base scenario**, you reach **Financial Independence** at age "
                 f"**{base_result.fi_age}**, when your portfolio first crosses the (inflation-adjusted) "
                 f"FI number for that year."
-            )
-        else:
-            st.markdown(
-                "❌ In the **base scenario**, you do **not** reach FI before your chosen retirement age. "
-                "Try increasing monthly investing, bonuses, or expected return, or lowering target spending."
             )
 
         # --- Monte Carlo section ---
@@ -1115,7 +1168,9 @@ def main():
         st.subheader("📊 Probability of Reaching FI by Retirement")
 
         years_to_retirement = retirement_age - current_age
-        fi_number_at_retirement = base_result.fi_number_today * ((1 + inflation_rate) ** years_to_retirement)
+        fi_number_at_retirement = base_result.fi_number_today * (
+            (1 + inflation_rate) ** years_to_retirement
+        )
 
         final_values = mc["all_paths"][:, -1]  # portfolio at retirement for each simulation
         prob_fi = (final_values >= fi_number_at_retirement).mean() * 100.0
@@ -1123,10 +1178,11 @@ def main():
         st.metric("Probability of Reaching FI by Retirement", f"{prob_fi:.1f}%")
 
     st.markdown("---")
-    st.caption("Built for Klaas' FI obsession 🧮. Portfolio is remembered in your browser, performance charted from real prices.")
+    st.caption(
+        "Built for Klaas' FI obsession 🧮. Portfolio (including crypto) is remembered in your browser, "
+        "performance charted from real EUR prices."
+    )
 
 
 if __name__ == "__main__":
     main()
-
-
