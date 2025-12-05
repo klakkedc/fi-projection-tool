@@ -142,8 +142,7 @@ def run_projection(params: ProjectionInput) -> ProjectionResult:
             fi_year_index = yr.year_index
             break
 
-    # Coast FI age: first age where, if you stop investing completely and
-    # just let the portfolio grow until retirement, you'll still hit FI at retirement.
+    # Coast FI age
     coast_fi_age: Optional[int] = None
     annual_rate = params.annual_return
     num_years_total = num_years
@@ -386,12 +385,6 @@ def allocation_from_portfolio(df: pd.DataFrame) -> dict:
 def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataFrame:
     """
     Bulletproof: Builds a history of total portfolio value based on current tickers + shares.
-    Handles:
-    - single ticker
-    - multi-index columns
-    - missing Adj Close
-    - partially failing tickers
-    - forward-fill + outlier cleaning
     """
     df = df.copy()
 
@@ -461,25 +454,23 @@ def compute_portfolio_history(df: pd.DataFrame, period: str = "6mo") -> pd.DataF
 
     # Remove unrealistic single-day jumps (e.g. data glitches)
     hist["Return"] = hist["PortfolioValue"].pct_change()
-    outliers = hist["Return"].abs() > 0.08  # > 8% daily = treat as bad data
+    outliers = hist["Return"].abs() > 0.08
     hist.loc[outliers, "PortfolioValue"] = np.nan
     hist["PortfolioValue"] = hist["PortfolioValue"].ffill()
     hist = hist.drop(columns=["Return"])
 
     return hist
 
+
 def compute_correlation_matrix_from_portfolio(df: pd.DataFrame, period: str = "1y") -> pd.DataFrame:
     """
     Computes a correlation matrix of daily returns for all tickers in the portfolio.
-    - Uses adjusted close prices where available.
-    - Filters out empty tickers / zero-share rows.
     """
     df = df.copy()
 
     if "Ticker" not in df.columns:
         return pd.DataFrame()
 
-    # Use all non-empty tickers, even if Shares = 0, since correlation is independent of size
     df = df[df["Ticker"].astype(str).str.strip() != ""]
     if df.empty:
         return pd.DataFrame()
@@ -517,35 +508,24 @@ def compute_correlation_matrix_from_portfolio(df: pd.DataFrame, period: str = "1
         else:
             return pd.DataFrame()
 
-    # Keep only columns we requested
     close = close[[c for c in close.columns if c in tickers]]
 
     if close.empty:
         return pd.DataFrame()
 
-    # Daily returns
     returns = close.pct_change().dropna(how="all")
-
-    # Drop columns that are all NaN
     returns = returns.dropna(axis=1, how="all")
 
     if returns.empty or returns.shape[1] < 2:
-        # Need at least 2 assets to compute correlation
         return pd.DataFrame()
 
     corr = returns.corr()
-
     return corr
 
 
-
-# ---------- LocalStorage Helpers (browser persistence) ----------
+# ---------- LocalStorage Helpers ----------
 
 def load_portfolio_from_localstorage():
-    """
-    Reads portfolio JSON from browser localStorage (if present)
-    and loads it into st.session_state["portfolio_df"].
-    """
     stored = streamlit_js_eval(
         js_expressions=f"window.localStorage.getItem('{LOCALSTORAGE_KEY}')",
         key="load_portfolio",
@@ -561,9 +541,6 @@ def load_portfolio_from_localstorage():
 
 
 def save_portfolio_to_localstorage(df: pd.DataFrame):
-    """
-    Saves the current portfolio dataframe to browser localStorage as JSON.
-    """
     try:
         json_str = df.to_json()
         js_code = f"window.localStorage.setItem('{LOCALSTORAGE_KEY}', {json.dumps(json_str)});"
@@ -597,11 +574,11 @@ def main():
                         "Class": "Stocks",
                     },
                     {
-                        "Ticker": "AGGH.DE",
+                        "Ticker": "MWRD.PA",
                         "Shares": 10.0,
                         "Price": 0.0,
                         "Value": 0.0,
-                        "Class": "Bonds",
+                        "Class": "Stocks",
                     },
                 ]
             )
@@ -698,75 +675,37 @@ def main():
                     f"Start: **€{start_val:,.0f}** → End: **€{end_val:,.0f}** "
                     f"({change_pct:+.1f}%) over **{period}**."
                 )
-def compute_correlation_matrix_from_portfolio(df: pd.DataFrame, period: str = "1y") -> pd.DataFrame:
-    """
-    Computes a correlation matrix of daily returns for all tickers in the portfolio.
-    - Uses adjusted close prices where available.
-    - Filters out empty tickers / zero-share rows.
-    """
-    df = df.copy()
 
-    if "Ticker" not in df.columns:
-        return pd.DataFrame()
+    # --- Correlation matrix between holdings ---
 
-    # Use all non-empty tickers, even if Shares = 0, since correlation is independent of size
-    df = df[df["Ticker"].astype(str).str.strip() != ""]
-    if df.empty:
-        return pd.DataFrame()
-
-    tickers = df["Ticker"].astype(str).str.strip().tolist()
-
-    try:
-        raw = yf.download(
-            tickers,
-            period=period,
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
+    with st.expander("🧩 Correlation between your holdings", expanded=False):
+        corr_period = st.selectbox(
+            "Period for correlation",
+            options=["6mo", "1y", "2y", "5y"],
+            index=1,
+            key="corr_period",
         )
-    except Exception as e:
-        st.error(f"Error downloading historical prices for correlation: {e}")
-        return pd.DataFrame()
 
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-
-    # Extract close/adj close
-    if isinstance(raw.columns, pd.MultiIndex):
-        if "Adj Close" in raw.columns.levels[0]:
-            close = raw["Adj Close"]
-        elif "Close" in raw.columns.levels[0]:
-            close = raw["Close"]
-        else:
-            return pd.DataFrame()
-    else:
-        if "Adj Close" in raw.columns:
-            close = raw["Adj Close"].to_frame()
-        elif "Close" in raw.columns:
-            close = raw["Close"].to_frame()
-        else:
-            return pd.DataFrame()
-
-    # Keep only columns we requested
-    close = close[[c for c in close.columns if c in tickers]]
-
-    if close.empty:
-        return pd.DataFrame()
-
-    # Daily returns
-    returns = close.pct_change().dropna(how="all")
-
-    # Drop columns that are all NaN
-    returns = returns.dropna(axis=1, how="all")
-
-    if returns.empty or returns.shape[1] < 2:
-        # Need at least 2 assets to compute correlation
-        return pd.DataFrame()
-
-    corr = returns.corr()
-
-    return corr
-
+        if st.button("Compute correlation matrix", key="build_corr"):
+            corr = compute_correlation_matrix_from_portfolio(
+                portfolio_df, period=corr_period
+            )
+            if corr.empty:
+                st.warning(
+                    "Could not compute correlations. "
+                    "Check that you have at least two valid tickers with historical data."
+                )
+            else:
+                styled = corr.style.format("{:.2f}")
+                try:
+                    styled = styled.background_gradient(cmap="coolwarm", axis=None)
+                except Exception:
+                    pass
+                st.dataframe(styled, use_container_width=True)
+                st.caption(
+                    "Values close to 1 = move together, close to 0 = largely independent, "
+                    "negative = tend to move in opposite directions."
+                )
 
     # Derive allocation from portfolio (for use-my-portfolio mode)
     portfolio_alloc = allocation_from_portfolio(portfolio_df)
@@ -793,7 +732,6 @@ def compute_correlation_matrix_from_portfolio(df: pd.DataFrame, period: str = "1
 
     col_start_val, col_sync = st.sidebar.columns([2, 1])
 
-    # Handle sync first
     with col_sync:
         sync_clicked = st.sidebar.button("Sync\nfrom table")
         if sync_clicked:
@@ -1009,7 +947,6 @@ def compute_correlation_matrix_from_portfolio(df: pd.DataFrame, period: str = "1
                     amount=float(custom_amount),
                 )
             )
-
 
     early_retirement_age = st.sidebar.slider(
         "Early Retirement Age (for analysis)",
